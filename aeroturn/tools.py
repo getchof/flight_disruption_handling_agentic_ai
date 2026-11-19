@@ -23,7 +23,6 @@ import guards as g
 import turnaround
 
 DB = db.DB_PATH   # tests point this at a temporary copy
-NOW = db.NOW
 
 # Demo switch: make a "concurrent booking" steal a seat mid-batch, to show the rollback.
 SIMULATE_SEAT_CONFLICT = {"enabled": False, "at_item": 3}
@@ -38,8 +37,13 @@ def _conn():
     return db.connect(DB)
 
 
+def _now():
+    """Scenario clock: the moment the late aircraft landed (stored with the scenario in the DB)."""
+    return db.scenario(_conn())["now"]
+
+
 def _ts():
-    return NOW.strftime(db.TIME_FMT)
+    return _now().strftime(db.TIME_FMT)
 
 
 def _hhmm(dt):
@@ -49,7 +53,7 @@ def _hhmm(dt):
 def _parse_time(text):
     """Accept '11:45' or '2026-11-20 11:45'."""
     text = text.strip()
-    return db.to_time(text) if len(text) > 5 else db.to_time(f"{NOW:%Y-%m-%d} {text}")
+    return db.to_time(text) if len(text) > 5 else db.to_time(f"{_now():%Y-%m-%d} {text}")
 
 
 def audit(conn, actor, action, detail, outcome):
@@ -74,7 +78,7 @@ def _inbound_arrival(conn, flight):
     """Landing time of the aircraft that will operate `flight` (same registration)."""
     row = conn.execute("SELECT est_arr FROM flights WHERE aircraft_reg=? AND destination='DXB'",
                        (flight["aircraft_reg"],)).fetchone()
-    return db.to_time(row["est_arr"]) if row else NOW
+    return db.to_time(row["est_arr"]) if row else _now()
 
 
 def _floor_departure(conn, flight):
@@ -99,11 +103,11 @@ def _best_team(conn, flight, dep):
     standby = [{**dict(r), "duty_start": db.to_time(r["duty_start"]) if r["duty_start"] else None}
                for r in conn.execute("SELECT * FROM crew WHERE status='STANDBY' ORDER BY minutes_away")]
     for c in current:
-        if not g.check_crew_legal([c], dep, flight["block_min"], NOW):
+        if not g.check_crew_legal([c], dep, flight["block_min"], _now()):
             continue
         choice = None
         for s in (x for x in standby if x["role"] == c["role"]):
-            why = g.check_crew_legal([s], dep, flight["block_min"], NOW) + g.check_crew_reachable([s], dep, NOW)
+            why = g.check_crew_legal([s], dep, flight["block_min"], _now()) + g.check_crew_reachable([s], dep, _now())
             if why:
                 rejected.append({"crew_id": s["crew_id"], "name": s["name"], "why": why[0]})
             elif choice is None:
@@ -121,7 +125,7 @@ def _crew_minutes(conn, flight):
     """How far away the crew that will operate is (for the critical path). None = no legal crew."""
     floor = _floor_departure(conn, flight)
     current = _crew_on(conn, flight["flight_id"])
-    if current and not g.check_crew_legal(current, floor, flight["block_min"], NOW):
+    if current and not g.check_crew_legal(current, floor, flight["block_min"], _now()):
         return max(c["minutes_away"] for c in current)
     pending = _pending_crew_swap(conn, flight["flight_id"])
     if pending:
@@ -235,10 +239,10 @@ def get_turnaround_and_crew_state() -> dict:
 
     def crew_row(c):
         start = db.to_time(c["duty_start"]) if c["duty_start"] else None
-        problems = g.check_crew_legal([{**dict(c), "duty_start": start}], planned, outbound["block_min"], NOW)
+        problems = g.check_crew_legal([{**dict(c), "duty_start": start}], planned, outbound["block_min"], _now())
         return {"crew_id": c["crew_id"], "name": c["name"], "role": c["role"], "status": c["status"],
                 "location": c["location"], "minutes_away": c["minutes_away"],
-                "duty_min_left_now": round(g.duty_minutes_left(start, NOW, NOW)),
+                "duty_min_left_now": round(g.duty_minutes_left(start, _now(), _now())),
                 "legal_for_EK-813": not problems}
 
     crew = [crew_row(c) for c in conn.execute("SELECT * FROM crew WHERE assigned_flight='EK-813'")]
@@ -249,7 +253,7 @@ def get_turnaround_and_crew_state() -> dict:
     options = {dest: _options(conn, dest, arrival) for dest in sorted({p["final_destination"] for p in missed})}
 
     gate = outbound["gate"]
-    gate_problem = g.check_gate({"gate_id": gate, "wide_body": 1}, outbound["body"], NOW, planned,
+    gate_problem = g.check_gate({"gate_id": gate, "wide_body": 1}, outbound["body"], _now(), planned,
                                 _gate_bookings(conn, gate, except_flight="EK-813"))
     pending = [dict(r) for r in conn.execute(
         "SELECT approval_id, kind, payload, status FROM pending_approvals WHERE status='PENDING'")]
@@ -341,7 +345,8 @@ def execute_atomic_passenger_rebook(passenger_ids: list[str], new_flight: str) -
             done.append({"passenger_id": pid, "seat": seat["seat_no"]})
             progress["done"] = len(done)
         return {"status": "committed", "new_flight": new_flight, "departs": flight["est_dep"][-5:],
-                "rebooked": done, "integrity_before": before,
+                "rebooked": done, "vulnerable_in_batch": sum(g.is_vulnerable(p["tier"]) for p in batch),
+                "integrity_before": before,
                 "summary": f"{len(done)} passengers to {new_flight}"}
 
     result = write_gateway("rebook_committed", "CODE", request, apply)
@@ -366,6 +371,20 @@ def _pending_gate_change(conn, flight_id):
     return None
 
 
+def chosen_plan(conn=None):
+    """The recovery option (A/B/C) the controller chose for EK-813, or None."""
+    row = (conn or _conn()).execute("SELECT detail FROM audit_log WHERE action='recovery_plan_selected' "
+                                    "ORDER BY id DESC LIMIT 1").fetchone()
+    return row[0] if row else None
+
+
+def approved_changes(conn=None, flight_id="EK-813"):
+    """Changes for a flight that a controller has already approved (= option A is being executed)."""
+    rows = (conn or _conn()).execute("SELECT approval_id, kind, payload FROM pending_approvals "
+                                     "WHERE status='APPROVED' ORDER BY approval_id").fetchall()
+    return [f"#{r['approval_id']} {r['kind']}" for r in rows if json.loads(r["payload"])["flight_id"] == flight_id]
+
+
 def _check_change(conn, kind, flight_id, new_time, gate, crew_in):
     """Run the guards for a proposed change. Used when staging AND again on approval."""
     flight = _flight(conn, flight_id)
@@ -374,9 +393,16 @@ def _check_change(conn, kind, flight_id, new_time, gate, crew_in):
     dep = _parse_time(new_time) if new_time else max(db.to_time(flight["est_dep"]), _earliest_departure(conn, flight))
     arrival = _inbound_arrival(conn, flight)
 
+    # Plan consistency: crew swap / gate / delay / departure belong to option A. If the controller
+    # chose option B (wait for crew rest) or C (cancel), these changes would contradict that decision.
+    plan = chosen_plan(conn)
+    if flight_id == "EK-813" and plan in ("B", "C"):
+        return [f"PLAN: the controller chose option {plan} for EK-813; a {kind} belongs to option A and "
+                f"would contradict that decision"], dep
+
     if kind == "DEPARTURE":
         return g.check_departure(_crew_on(conn, flight_id), _maintenance(conn, flight["aircraft_reg"]),
-                                 dep, arrival, flight["block_min"], NOW), dep
+                                 dep, arrival, flight["block_min"], _now()), dep
     if kind == "DELAY":
         v = []
         if dep < _earliest_departure(conn, flight):
@@ -390,13 +416,13 @@ def _check_change(conn, kind, flight_id, new_time, gate, crew_in):
             gate_id = pending_gate["gate"]
         row = conn.execute("SELECT * FROM gates WHERE gate_id=?", (gate_id,)).fetchone()
         v += [x + ("" if pending_gate else " (stage a GATE_CHANGE first)") for x in
-              g.check_gate(dict(row), flight["body"], NOW, dep, _gate_bookings(conn, gate_id, except_flight=flight_id))]
+              g.check_gate(dict(row), flight["body"], _now(), dep, _gate_bookings(conn, gate_id, except_flight=flight_id))]
         return v, dep
     if kind == "GATE_CHANGE":
         row = conn.execute("SELECT * FROM gates WHERE gate_id=?", (gate,)).fetchone()
         if not row:
             return [f"Unknown gate {gate}"], dep
-        return g.check_gate(dict(row), flight["body"], NOW, dep, _gate_bookings(conn, gate, except_flight=flight_id)), dep
+        return g.check_gate(dict(row), flight["body"], _now(), dep, _gate_bookings(conn, gate, except_flight=flight_id)), dep
     if kind == "CREW_SWAP":
         ids = [c.strip() for c in crew_in.split(",") if c.strip()]
         incoming = [dict(r) for r in conn.execute(
@@ -406,8 +432,8 @@ def _check_change(conn, kind, flight_id, new_time, gate, crew_in):
         new_team = [c for c in _crew_on(conn, flight_id) if c["role"] not in {i["role"] for i in incoming}]
         new_team += [{**c, "duty_start": db.to_time(c["duty_start"]) if c["duty_start"] else None} for c in incoming]
         v += g.check_crew_complement(new_team)
-        v += g.check_crew_legal(new_team, dep, flight["block_min"], NOW)
-        v += g.check_crew_reachable(incoming, dep, NOW)
+        v += g.check_crew_legal(new_team, dep, flight["block_min"], _now())
+        v += g.check_crew_reachable(incoming, dep, _now())
         return v, dep
     return [f"Unknown kind {kind}; use one of {KINDS}"], dep
 
@@ -499,7 +525,7 @@ def find_legal_standby_crew(flight_id: str) -> dict:
     return {"status": "ok" if not missing else "incomplete", "flight": flight_id,
             "replace": [p["replaces"] for p in picks], "recommended_crew_in": ",".join(p["crew_id"] for p in picks),
             "team": picks, "roles_without_legal_standby": missing, "rejected_standby": rejected,
-            "team_ready_at": (NOW + timedelta(minutes=(minutes or 0) + g.LIMITS.CREW_BRIEFING_MIN)).strftime("%H:%M")
+            "team_ready_at": (_now() + timedelta(minutes=(minutes or 0) + g.LIMITS.CREW_BRIEFING_MIN)).strftime("%H:%M")
             if minutes is not None else None,
             "projected_departure": _hhmm(max(floor, cpm["departure"])) if cpm["departure"] else None}
 
@@ -610,6 +636,12 @@ def verified_facts():
     }
 
 
-def reset():
-    """Rebuild the database from the seed (console 'Reset' button)."""
-    db.build(DB)
+def reset(**settings):
+    """Rebuild the database (console buttons). No settings = the brief's scenario."""
+    db.build(DB, **settings)
+
+
+def current_settings():
+    """The what-if settings the current database was built with (without the clock)."""
+    s = db.scenario(_conn())
+    return {k: s[k] for k in db.DEFAULT_SCENARIO}

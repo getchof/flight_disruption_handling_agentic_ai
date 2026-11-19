@@ -10,6 +10,7 @@ whether EU261/UK261 legally applies depends on carrier and route):
   rerouted, >3500 km, arrival delay <= 4 h: 50 % reduction
   care: meals EUR 25 if delay >= 2 h, hotel EUR 150 if overnight
 """
+import json
 from datetime import timedelta
 from types import MappingProxyType
 
@@ -82,13 +83,21 @@ def get_recovery_options() -> dict:
     options = []
 
     # A: swap crew, move gate, short delay (needs controller approvals + engineer sign-off)
-    dep_a = db.to_time(f"{db.NOW:%Y-%m-%d} {match['projected_departure']}") if match["projected_departure"] else None
+    sc = db.scenario(conn)
+    state = T.get_turnaround_and_crew_state()
+    crew_ok = all(c["legal_for_EK-813"] for c in state["crew_on_EK-813"])
+    dep_a = db.to_time(f"{sc['now']:%Y-%m-%d} {match['projected_departure']}") if match["projected_departure"] else None
     if dep_a:
+        dep_a = max(dep_a, sched)                       # never earlier than the timetable
         delay = int((dep_a - sched).total_seconds() // 60)
+        actions = ([] if crew_ok else [f"CREW_SWAP {match['recommended_crew_in']}"]) + \
+                  ([f"GATE_CHANGE ({state['outbound']['gate_problem'][0]})"] if state["outbound"]["gate_problem"] else []) + \
+                  ([f"DELAY to {dep_a:%H:%M}"] if delay > 0 else []) + \
+                  (["Engineer sign-off M-1001"] if maint_open else [])
         options.append({
-            "id": "A", "title": f"Standby crew swap + gate change + depart {dep_a:%H:%M}",
-            "actions": [f"CREW_SWAP {match['recommended_crew_in']}", "GATE_CHANGE (B12 taken from 11:00)",
-                        f"DELAY to {dep_a:%H:%M}", "Engineer sign-off M-1001"],
+            "id": "A", "title": (("Standby crew swap + " if not crew_ok else "") +
+                                 (f"depart {dep_a:%H:%M}" if delay > 0 else "depart on time")),
+            "actions": actions or ["No change needed"],
             "ek813_delay_min": delay,
             "compensation_eur": EK813_PAX * compensation(km, delay),
             "care_eur": EK813_PAX * care(delay),
@@ -98,21 +107,23 @@ def get_recovery_options() -> dict:
             "blockers": (["M-1001 sign-off still needed"] if maint_open else []) + (
                 [] if match["status"] == "ok" else [f"No legal standby for {match['roles_without_legal_standby']}"])})
 
-    # B: wait for the inbound crew to finish legal rest
-    duty_end = db.NOW + timedelta(minutes=20)
+    # B: wait for the inbound crew to finish legal rest (only an option when the crew is the problem)
+    duty_end = sc["now"] + timedelta(minutes=max(sc["crew_duty_left_min"], 0))
     dep_b = duty_end + timedelta(minutes=CREW_REST_MIN + 60)
     delay_b = int((dep_b - sched).total_seconds() // 60)
-    options.append({
-        "id": "B", "title": f"Wait for inbound crew rest, depart {dep_b:%H:%M}",
-        "actions": [f"DELAY to {dep_b:%H:%M}", f"Meals for {EK813_PAX} passengers", "Engineer sign-off M-1001"],
-        "ek813_delay_min": delay_b,
-        "compensation_eur": EK813_PAX * compensation(km, delay_b),
-        "care_eur": EK813_PAX * care(delay_b),
-        "operational_eur": 0,
-        "knock_on": f"EK-814 return delayed ~{delay_b // 60} h: {EK814_PAX} more passengers affected "
-                    f"(EUR {EK814_PAX * compensation(km, delay_b):,})",
-        "knock_on_eur": EK814_PAX * compensation(km, delay_b),
-        "feasible": True, "blockers": ["M-1001 sign-off still needed"] if maint_open else []})
+    if not crew_ok:
+        options.append({
+            "id": "B", "title": f"Wait for inbound crew rest, depart {dep_b:%H:%M}",
+            "actions": [f"DELAY to {dep_b:%H:%M}", f"Meals for {EK813_PAX} passengers"] +
+                       (["Engineer sign-off M-1001"] if maint_open else []),
+            "ek813_delay_min": delay_b,
+            "compensation_eur": EK813_PAX * compensation(km, delay_b),
+            "care_eur": EK813_PAX * care(delay_b),
+            "operational_eur": 0,
+            "knock_on": f"EK-814 return delayed ~{delay_b // 60} h: {EK814_PAX} more passengers affected "
+                        f"(EUR {EK814_PAX * compensation(km, delay_b):,})",
+            "knock_on_eur": EK814_PAX * compensation(km, delay_b),
+            "feasible": True, "blockers": ["M-1001 sign-off still needed"] if maint_open else []})
 
     # C: cancel and re-accommodate tomorrow
     options.append({
@@ -124,20 +135,40 @@ def get_recovery_options() -> dict:
         "operational_eur": 0,
         "knock_on": f"EK-814 cancelled: {EK814_PAX} more passengers affected (EUR {EK814_PAX * 600:,})",
         "knock_on_eur": EK814_PAX * 600,
-        "feasible": True, "blockers": []})
+        # Cancelling avoids today's departure, but the aircraft stays grounded until the inspection is signed off
+        "feasible": True, "blockers": ["Aircraft A6-EQX stays grounded until M-1001 is signed off "
+                                       "(no departure today, so nothing blocks the cancellation itself)"]
+        if maint_open else []})
 
     for o in options:
         o["total_eur"] = o["compensation_eur"] + o["care_eur"] + o["operational_eur"] + o.get("knock_on_eur", 0)
     cheapest = min((o for o in options if o["feasible"]), key=lambda o: o["total_eur"])
-    chosen = conn.execute("SELECT detail FROM audit_log WHERE action='recovery_plan_selected' "
-                          "ORDER BY id DESC LIMIT 1").fetchone()
+    executing = T.approved_changes(conn)
     return {"currency": "EUR", "basis": "EU261-style bands, indicative", "options": options,
-            "lowest_cost_feasible": cheapest["id"], "selected_by_controller": chosen[0] if chosen else None,
+            "lowest_cost_feasible": cheapest["id"], "selected_by_controller": T.chosen_plan(conn),
+            "option_a_in_execution": executing,
             "connecting_passengers": passenger_recovery()}
 
 
 def select_recovery_plan(option_id, controller):
-    """HUMAN action (console only): the Operations Controller chooses a recovery option."""
+    """HUMAN action (console only): the Operations Controller chooses a recovery option.
+    Code keeps the decision consistent with what has already happened:
+      - option A steps already APPROVED  -> B or C is refused (A is being executed)
+      - option A steps only PENDING      -> choosing B or C rejects them automatically"""
     conn = db.connect(T.DB)
+    if option_id != "A":
+        done = T.approved_changes(conn)
+        if done:
+            T.audit(conn, "CODE", "recovery_plan_refused", option_id,
+                    f"option A already being executed: {', '.join(done)}")
+            return {"status": "refused", "reason": f"Option A is already being executed (approved: {', '.join(done)}). "
+                                                   f"Option {option_id} would contradict it."}
+        superseded = []
+        for r in conn.execute("SELECT approval_id, payload FROM pending_approvals WHERE status='PENDING'").fetchall():
+            if json.loads(r["payload"])["flight_id"] == "EK-813":
+                T._set_approval_status(r["approval_id"], "REJECTED", controller, f"superseded by option {option_id}")
+                superseded.append(r["approval_id"])
+    else:
+        superseded = []
     T.audit(conn, "HUMAN", "recovery_plan_selected", option_id, f"chosen by {controller}")
-    return {"status": "selected", "option": option_id}
+    return {"status": "selected", "option": option_id, "superseded_approvals": superseded}

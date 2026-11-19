@@ -23,7 +23,7 @@ database directly and never approves anything. Every change goes through one wri
 | 7b | Risky → human | Departure release, delay, crew swap, gate change → `pending_approvals` → controller Approve/Reject; engineer sign-off | `tools.py`, `app.py` | Human |
 | 8 | One write gateway | `write_gateway()`: re-check guards → `BEGIN IMMEDIATE` → apply → integrity check → `COMMIT` or `ROLLBACK` → audit | `tools.py` | Code |
 | 9 | Log & report | SHA-256 hash-chained audit log (AI / CODE / HUMAN actor on every row) + AI executive brief beside code-verified facts | `db.py`, `agent.py` | Code + AI |
-| 10 | Demo | OCC console, red-team scorecard (16/16), critical-path Gantt, recovery options | `app.py`, `redteam.py` | You |
+| 10 | Demo | OCC console, red-team scorecard (17/17), critical-path Gantt, recovery options | `app.py`, `redteam.py` | You |
 
 ### Tech stack
 - **Python 3.11+**, **SQLite** (stdlib), **Streamlit** console. Backend = Python modules imported in-process (no web server needed).
@@ -54,10 +54,11 @@ agent/
     ├── tools.py         # agent tools + single write gateway + human actions
     ├── costs.py         # recovery options + EU261-style compensation
     ├── agent.py         # LLM loop, provider fallback, input screening, checklist guard
-    ├── redteam.py       # 16 attacks on a fresh copy of the scenario
+    ├── redteam.py       # 17 attacks on a fresh copy of the scenario
     ├── app.py           # Streamlit OCC console
     ├── test_guards.py   # 21 tests: rules + database (no AI)
-    └── test_tools.py    # 19 tests: services, rollback, approval gate (no AI)
+    ├── test_tools.py    # 19 tests: services, rollback, approval gate (no AI)
+    └── test_whatif.py   # 10 tests: other delays / crew / maintenance / seats (no AI)
 ```
 
 | File | Responsibility | Key functions | Connections |
@@ -68,7 +69,7 @@ agent/
 | `tools.py` | The 3 brief services + matcher + notifications; **`write_gateway`** is the only function that writes; human actions are NOT agent tools | `get_turnaround_and_crew_state`, `execute_atomic_passenger_rebook`, `stage_controller_schedule_change`, `find_legal_standby_crew`, `send_passenger_notification`, `approve`, `reject`, `engineer_sign_off`, `verified_facts`, `turnaround_plan_for` | `db`, `guards`, `turnaround` |
 | `costs.py` | Prices options A/B/C (compensation, care, crew call-out, knock-on) — money maths in code only | `get_recovery_options` (agent tool), `select_recovery_plan` (human) | `tools.py` |
 | `agent.py` | ReAct loop; fallback chain; `screen_input` (regex + Prompt Guard); checklist guard with `MAX_REPLANS=3` then human review; text-tool-call parser for small models; logs every AI request | `run_agent`, `call_with_fallback`, `screen_input`, `remaining_work`, `hand_to_human` | `tools`, `costs`, `guards` |
-| `redteam.py` | Proves the guards: 16 attacks, evidence for each | `run_suite` | everything |
+| `redteam.py` | Proves the guards: 17 attacks, evidence for each | `run_suite` | everything |
 | `app.py` | Console: controls, live timeline (🤖/⚙️/👤), approval queue, KPIs, tabs (options, Gantt, red-team, audit chain, passengers) | `on_agent_step`, `act_*` buttons | `agent`, `tools`, `costs`, `redteam` |
 
 ---
@@ -82,6 +83,7 @@ agent/
 | 3. AI brain | Agent loop, provider fallback, injection screen, executive brief + verified facts | ✅ cloud run clean |
 | 4. Console | Streamlit OCC, demo buttons, approval cards | ✅ headless click-through |
 | **Stretch** | Standby crew matcher · turnaround critical path · EU261 options · red-team scorecard · hash-chained audit · Prompt Guard layer | ✅ all built |
+| **What-if** | Scenario built from settings (delay, crew duty left, M-1001 open, seat factor) stored in a `scenario` table; the clock = landing time; console builder + presets; `test_whatif.py` | ✅ 10/10 |
 
 ---
 
@@ -106,6 +108,6 @@ at approval time. The AI has no tool to approve, reject, sign off or choose.
 - *"Add a new attack to redteam.py that tries <X>; it must be stopped by an existing guard or you must add the guard in guards.py with a test."*
 
 ## Assumptions
-- Scenario clock is fixed at 2026-11-20 10:15 Dubai time (demo date lock), all data synthetic.
+- Scenario clock = the moment EK-812 lands (10:15 in the brief's scenario; moves with the what-if delay). All data synthetic.
 - Compensation uses EU261-style bands as an **indicative** airline cost benchmark (legal applicability depends on carrier/route).
 - Single-user console; SQLite `BEGIN IMMEDIATE` serialises writes.
