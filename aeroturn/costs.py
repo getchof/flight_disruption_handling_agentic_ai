@@ -107,15 +107,18 @@ def get_recovery_options(flight_id: str) -> dict:
     options = []
 
     # A: swap crew (if needed), move gate (if needed), short delay (controller approvals + sign-offs)
-    dep_a = db.to_time(f"{T.NOW:%Y-%m-%d} {match['projected_departure']}") if match["projected_departure"] else None
+    dep_a = db.to_time(f"{T._now():%Y-%m-%d} {match['projected_departure']}") if match["projected_departure"] else None
     if dep_a:
-        delay = max(int((dep_a - sched).total_seconds() // 60), 0)
+        dep_a = max(dep_a, sched)                       # never earlier than the timetable
+        delay = int((dep_a - sched).total_seconds() // 60)
         steps = ([] if crew_ok else [f"CREW_SWAP {match['recommended_crew_in']}"]) + \
-                ([f"GATE_CHANGE ({gate_problem[0]})"] if gate_problem else []) + [f"DELAY to {dep_a:%H:%M}"]
+                ([f"GATE_CHANGE ({gate_problem[0]})"] if gate_problem else []) + \
+                ([f"DELAY to {dep_a:%H:%M}"] if delay > 0 else [])
         options.append({
             "id": "A", "title": " + ".join((["Standby crew swap"] if not crew_ok else []) +
-                                           (["gate change"] if gate_problem else []) + [f"depart {dep_a:%H:%M}"]),
-            "actions": steps + signoffs,
+                                           (["gate change"] if gate_problem else []) +
+                                           [f"depart {dep_a:%H:%M}" if delay > 0 else "depart on time"]),
+            "actions": (steps + signoffs) or ["No change needed"],
             "delay_min": delay,
             "compensation_eur": pax * compensation(km, delay),
             "care_eur": pax * care(delay),
@@ -128,8 +131,8 @@ def get_recovery_options(flight_id: str) -> dict:
     # B: keep the current crew and wait until they have rested (only if the crew is the problem)
     if not crew_ok:
         current = T._crew_on(conn, flight_id)
-        left = min((g.duty_minutes_left(c["duty_start"], T.NOW, T.NOW) for c in current if c["duty_start"]), default=0)
-        duty_end = T.NOW + timedelta(minutes=max(left, 0))
+        left = min((g.duty_minutes_left(c["duty_start"], T._now(), T._now()) for c in current if c["duty_start"]), default=0)
+        duty_end = T._now() + timedelta(minutes=max(left, 0))
         dep_b = duty_end + timedelta(minutes=CREW_REST_MIN + 60)
         delay_b = int((dep_b - sched).total_seconds() // 60)
         options.append({
@@ -155,28 +158,38 @@ def get_recovery_options(flight_id: str) -> dict:
         "knock_on": f"{ret_id} cancelled: {ret_pax} more passengers affected "
                     f"(EUR {ret_pax * compensation(km, 24 * 60):,})",
         "knock_on_eur": ret_pax * compensation(km, 24 * 60),
-        "feasible": True, "blockers": []})
+        # Cancelling avoids today's departure, but the aircraft stays grounded until the inspection is signed off
+        "feasible": True,
+        "blockers": [f"Aircraft {flight['aircraft_reg']} stays grounded until {', '.join(open_items)} is signed off "
+                     f"(no departure today, so nothing blocks the cancellation itself)"] if open_items else []})
 
     for o in options:
         o["total_eur"] = o["compensation_eur"] + o["care_eur"] + o["operational_eur"] + o.get("knock_on_eur", 0)
     cheapest = min((o for o in options if o["feasible"]), key=lambda o: o["total_eur"])
-    chosen = None
-    for r in conn.execute("SELECT detail FROM audit_log WHERE action='recovery_plan_selected' ORDER BY id DESC"):
-        try:
-            sel = json.loads(r[0])
-        except ValueError:        # older rows stored just the option letter (single-flight version)
-            sel = {"flight_id": "EK-813", "option": r[0]}
-        if sel.get("flight_id") == flight_id:
-            chosen = sel["option"]
-            break
     return {"flight": flight_id, "currency": "EUR", "basis": "EU261-style bands, indicative", "options": options,
-            "lowest_cost_feasible": cheapest["id"], "selected_by_controller": chosen,
+            "lowest_cost_feasible": cheapest["id"], "selected_by_controller": T.chosen_plan(conn, flight_id),
+            "option_a_in_execution": T.approved_changes(conn, flight_id),
             "connecting_passengers": passenger_recovery(inbound["flight_id"])}
 
 
 def select_recovery_plan(flight_id, option_id, controller):
-    """HUMAN action (console only): the Operations Controller chooses a recovery option."""
+    """HUMAN action (console only): the Operations Controller chooses a recovery option.
+    Code keeps the decision consistent with what has already happened:
+      - option A steps already APPROVED  -> B or C is refused (A is being executed)
+      - option A steps only PENDING      -> choosing B or C rejects them automatically"""
     conn = db.connect(T.DB)
+    superseded = []
+    if option_id != "A":
+        done = T.approved_changes(conn, flight_id)
+        if done:
+            T.audit(conn, "CODE", "recovery_plan_refused", {"flight_id": flight_id, "option": option_id},
+                    f"option A already being executed: {', '.join(done)}")
+            return {"status": "refused", "reason": f"Option A is already being executed for {flight_id} "
+                                                   f"(approved: {', '.join(done)}). Option {option_id} would contradict it."}
+        for r in conn.execute("SELECT approval_id, payload FROM pending_approvals WHERE status='PENDING'").fetchall():
+            if json.loads(r["payload"])["flight_id"] == flight_id:
+                T._set_approval_status(r["approval_id"], "REJECTED", controller, f"superseded by option {option_id}")
+                superseded.append(r["approval_id"])
     T.audit(conn, "HUMAN", "recovery_plan_selected", {"flight_id": flight_id, "option": option_id},
             f"chosen by {controller}")
-    return {"status": "selected", "flight": flight_id, "option": option_id}
+    return {"status": "selected", "flight": flight_id, "option": option_id, "superseded_approvals": superseded}

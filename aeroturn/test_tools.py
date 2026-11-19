@@ -210,6 +210,36 @@ def test_reject_changes_nothing():
     assert conn.execute("SELECT gate FROM flights WHERE flight_id='EK-813'").fetchone()[0] == "B12"
 
 
+# ---------- Plan consistency: recovery option vs approvals ----------
+def test_cannot_choose_b_after_option_a_steps_are_approved():
+    conn = fresh()
+    import costs
+    gate = T.stage_controller_schedule_change("GATE_CHANGE", "EK-813", "11:45", gate="B14")
+    T.approve(gate["approval_id"], "Controller Jane")
+    r = costs.select_recovery_plan("EK-813", "B", "Controller Jane")
+    assert r["status"] == "refused" and "#1 GATE_CHANGE" in r["reason"], r
+    assert T.chosen_plan(conn, "EK-813") is None
+
+
+def test_choosing_c_rejects_pending_a_steps_and_locks_new_ones():
+    conn = fresh()
+    import costs
+    T.stage_controller_schedule_change("CREW_SWAP", "EK-813", crew_in="S-201,S-203,S-204,S-206")
+    r = costs.select_recovery_plan("EK-813", "C", "Controller Jane")
+    assert r["status"] == "selected" and r["superseded_approvals"] == [1], r
+    assert conn.execute("SELECT status FROM pending_approvals WHERE approval_id=1").fetchone()[0] == "REJECTED"
+    blocked = T.stage_controller_schedule_change("GATE_CHANGE", "EK-813", "11:45", gate="B14")
+    assert blocked["status"] == "blocked" and "PLAN" in blocked["violations"][0], blocked
+
+
+def test_choosing_a_keeps_everything_allowed():
+    fresh()
+    import costs
+    assert costs.select_recovery_plan("EK-813", "A", "Controller Jane")["status"] == "selected"
+    assert T.stage_controller_schedule_change("GATE_CHANGE", "EK-813", "11:45", gate="B14")["status"] == \
+        "pending_controller_approval"
+
+
 # ---------- Tool 4: notifications ----------
 def test_notifications_use_real_facts():
     fresh()
