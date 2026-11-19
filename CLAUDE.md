@@ -1,6 +1,7 @@
-# Refund agent (hackathon practice)
+# Flight disruption agent (hackathon)
 
-A customer-support refund agent built on the Gemini SDK (`google-genai`). Main file: `refund_agent.py`.
+An airport disruption-recovery agent built on the Gemini SDK (`google-genai`), with local Ollama as a fallback.
+Main file: `aviation_agent.py`. Streamlit UI: `app.py`. Offline tests: `python test_scenarios.py`.
 
-- Business rules are enforced in code in `enforce_rules()`, not by the LLM. Put policy changes there, and keep the `SYSTEM` prompt consistent with it.
+- Business and safety rules are enforced in code inside the action tools (`rebook_passenger`, `reroute_baggage`, `reassign_crew`, `notify_passengers`), not by the LLM. Put rule changes there, and keep the `SYSTEM` prompt consistent with them.
 - Never read, edit, or print `.env`, and never print or log API keys.

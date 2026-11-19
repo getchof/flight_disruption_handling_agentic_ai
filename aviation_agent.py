@@ -5,7 +5,7 @@ Scenario: flight EK-101 (DXB -> LHR) is delayed 3 hours. The agent finds the
 connecting passengers, rebooks them, reroutes their bags, checks crew duty
 limits, notifies passengers and escalates risky cases to a duty manager.
 
-Same pattern as refund_agent.py: Gemini decides which tools to call, but every
+Gemini decides which tools to call, but every
 safety/business rule is enforced IN CODE inside the action tools, so the
 model cannot skip a rule even if it tries.
 
@@ -522,12 +522,12 @@ escalations, and any actions blocked by rules."""
 CONFIG = types.GenerateContentConfig(
     system_instruction=SYSTEM,
     tools=TOOL_FUNCS,
-    # We run the tool loop ourselves (same as refund_agent.py) so history survives a failed call.
+    # We run the tool loop ourselves so the history survives a failed call.
     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
 )
 
 
-# ---------- Agent loop (same pattern as refund_agent.py) ----------
+# ---------- Agent loop ----------
 def has_content(resp):
     """True if the response has a model turn we can add to the history."""
     return bool(resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts)
