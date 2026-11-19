@@ -104,6 +104,14 @@ def get_recovery_options(flight_id: str) -> dict:
     maint_blockers = [f"{i} sign-off still needed" for i in open_items]
     gate_problem = state["outbound"]["gate_problem"]
     crew_ok = all(c["legal_for_outbound"] for c in state["crew_on_outbound"])
+    # Steps of option A a controller has ALREADY approved still belong to the plan and keep their
+    # cost (the standby crew were called out when the swap was approved): count them, don't drop them.
+    approved = {}
+    for r in conn.execute("SELECT kind, payload FROM pending_approvals WHERE status='APPROVED' ORDER BY approval_id"):
+        p = json.loads(r["payload"])
+        if p.get("flight_id") == flight_id:
+            approved[r["kind"]] = p
+    called_out = [c.strip() for c in approved.get("CREW_SWAP", {}).get("crew_in", "").split(",") if c.strip()]
     options = []
 
     # A: swap crew (if needed), move gate (if needed), short delay (controller approvals + sign-offs)
@@ -111,18 +119,22 @@ def get_recovery_options(flight_id: str) -> dict:
     if dep_a:
         dep_a = max(dep_a, sched)                       # never earlier than the timetable
         delay = int((dep_a - sched).total_seconds() // 60)
-        steps = ([] if crew_ok else [f"CREW_SWAP {match['recommended_crew_in']}"]) + \
-                ([f"GATE_CHANGE ({gate_problem[0]})"] if gate_problem else []) + \
-                ([f"DELAY to {dep_a:%H:%M}"] if delay > 0 else [])
+        swap = "CREW_SWAP" in approved or not crew_ok
+        gate = "GATE_CHANGE" in approved or bool(gate_problem)
+        steps = ([f"CREW_SWAP {approved['CREW_SWAP']['crew_in']} (approved)"] if "CREW_SWAP" in approved else
+                 [] if crew_ok else [f"CREW_SWAP {match['recommended_crew_in']}"]) + \
+                ([f"GATE_CHANGE to {approved['GATE_CHANGE']['gate']} (approved)"] if "GATE_CHANGE" in approved else
+                 [f"GATE_CHANGE ({gate_problem[0]})"] if gate_problem else []) + \
+                ([f"DELAY to {dep_a:%H:%M}" + (" (approved)" if "DELAY" in approved else "")] if delay > 0 else [])
         options.append({
-            "id": "A", "title": " + ".join((["Standby crew swap"] if not crew_ok else []) +
-                                           (["gate change"] if gate_problem else []) +
+            "id": "A", "title": " + ".join((["Standby crew swap"] if swap else []) +
+                                           (["gate change"] if gate else []) +
                                            [f"depart {dep_a:%H:%M}" if delay > 0 else "depart on time"]),
             "actions": (steps + signoffs) or ["No change needed"],
             "delay_min": delay,
             "compensation_eur": pax * compensation(km, delay),
             "care_eur": pax * care(delay),
-            "operational_eur": STANDBY_CALLOUT_EUR * len(match["team"]),
+            "operational_eur": STANDBY_CALLOUT_EUR * (len(called_out) + (0 if crew_ok else len(match["team"]))),
             "knock_on": f"None: {ret_id} keeps its slot",
             "feasible": match["status"] == "ok",
             "blockers": maint_blockers + (

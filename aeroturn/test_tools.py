@@ -286,6 +286,23 @@ def test_midway_bag_transfer_failure_rolls_back_everything():
         assert T.execute_atomic_passenger_rebook(batch, "EK-075")["status"] == "committed"
 
 
+def test_option_a_keeps_its_cost_while_being_executed():
+    """Found in the console: after approving the crew swap, option A showed EUR 0 and lost
+    'crew swap + gate change' from its title. Approved steps are still part of the plan."""
+    import costs
+    fresh()
+    a = lambda: next(o for o in costs.get_recovery_options("EK-813")["options"] if o["id"] == "A")
+    before = a()
+    assert before["total_eur"] == 1500 and before["title"] == "Standby crew swap + gate change + depart 11:45"
+    for kind, kw in [("CREW_SWAP", {"crew_in": "S-201,S-203,S-204,S-206"}),
+                     ("GATE_CHANGE", {"new_time": "11:45", "gate": "B14"}),
+                     ("DELAY", {"new_time": "11:45"})]:
+        T.approve(T.stage_controller_schedule_change(kind, "EK-813", **kw)["approval_id"], "Controller Jane")
+        now = a()
+        assert (now["total_eur"], now["title"]) == (1500, before["title"]), (kind, now)
+    assert all(s.endswith("(approved)") for s in now["actions"] if not s.startswith("Engineer")), now["actions"]
+
+
 # ---------- Bags of passengers who missed their connection ----------
 def test_missed_connection_bags_are_held_until_rebooked():
     conn = fresh()
