@@ -1,0 +1,9 @@
+# Colors for the Streamlit UI (app.py): dark navy + amber, like an ops-centre screen.
+[theme]
+base = "dark"
+primaryColor = "#f5a623"
+backgroundColor = "#0b1d33"
+secondaryBackgroundColor = "#13294b"
+textColor = "#e8eef7"
+[client]
+toolbarMode = "minimal"   # hides the Deploy button for a cleaner demo
