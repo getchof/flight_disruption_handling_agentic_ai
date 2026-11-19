@@ -545,6 +545,12 @@ def list_providers():
             print(f"  {'KEY ' if has else '----'} {p['name']:<30} {p['key']} {'set' if has else 'not set'}")
 
 
+def default_alert():
+    """The disruption alert text for the current scenario (delay comes from the database)."""
+    delay = db.scenario(db.connect(T.DB))["delay_min"]
+    return f"EK-812 from Bangkok landed {delay} minutes late. Recover the turnaround and the missed connections."
+
+
 def print_verified_facts():
     f = T.verified_facts()
     print("VERIFIED BY CODE (from the database, not the AI)")
@@ -565,10 +571,14 @@ if __name__ == "__main__":
     only = args[args.index("--provider") + 1] if "--provider" in args else None
     if "--db" in args:   # run on a separate database file (e.g. a long local test)
         T.DB = Path(args[args.index("--db") + 1])
-    text = args[args.index("--message") + 1] if "--message" in args else \
-        "EK-812 from Bangkok landed 75 minutes late. Recover the turnaround and the missed connections."
     if "--keep" not in args:
-        db.build(T.DB)  # start from the clean scenario every time
+        settings = {}
+        if "--delay" in args:          # what-if: python agent.py --delay 150 --crew-left 600
+            settings["delay_min"] = int(args[args.index("--delay") + 1])
+        if "--crew-left" in args:
+            settings["crew_duty_left_min"] = int(args[args.index("--crew-left") + 1])
+        db.build(T.DB, **settings)     # start from a clean scenario every time
+    text = args[args.index("--message") + 1] if "--message" in args else default_alert()
     print("=" * 70)
     print(f"AeroTurn | providers: {[p['name'] for p in available_providers(only, '--local' in args)]}")
     print(f"MESSAGE: {text}\n")

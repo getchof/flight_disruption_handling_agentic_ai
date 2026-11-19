@@ -64,6 +64,9 @@ CREATE TABLE pending_approvals (
     approval_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, payload TEXT, reason TEXT,
     status TEXT, requested_by TEXT, requested_at TEXT, decided_by TEXT, decided_at TEXT);
 
+-- The what-if settings this database was built with, plus "now" (the scenario clock = landing time)
+CREATE TABLE scenario (key TEXT PRIMARY KEY, value TEXT);
+
 CREATE TABLE notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, passenger_id TEXT, text TEXT);
 
 -- actor = AI, CODE or HUMAN, so the demo shows who did what.
@@ -126,11 +129,14 @@ FLIGHTS = [
     ("EK-007", "DXB", "LHR", "A6-EGC", "B777-300ER", "WIDE", t("16:00"), t("16:00"), t("20:10"), t("20:10"), 490, "B4", "SCHEDULED"),
     ("EK-203", "DXB", "JFK", "A6-EGD", "B777-300ER", "WIDE", t("15:00"), t("15:00"), t("21:10"), t("21:10"), 850, "A12", "SCHEDULED"),
     ("EK-075", "DXB", "CDG", "A6-EPE", "B777-300ER", "WIDE", t("15:30"), t("15:30"), t("20:20"), t("20:20"), 410, "B22", "SCHEDULED"),
+    # Extra options used only in long-delay what-if scenarios (Mumbai / Hong Kong connections break too)
+    ("EK-513", "DXB", "BOM", "A6-ENL", "B777-300ER", "WIDE", t("17:00"), t("17:00"), t("21:25"), t("21:25"), 185, "C2", "SCHEDULED"),
+    ("EK-386", "DXB", "HKG", "A6-EQC", "B777-300ER", "WIDE", t("18:30"), t("18:30"), t("05:55", 21), t("05:55", 21), 445, "C10", "SCHEDULED"),
     ("EK-555", "DXB", "DOH", "A6-EQB", "B777-300ER", "WIDE", t("12:30"), t("12:30"), t("12:45"), t("12:45"), 75, "B12", "SCHEDULED"),
 ]
 
 # Free seats on each rebooking option. LHR and JFK are SHORT on seats -> priority matters.
-FREE_SEATS = {"EK-003": 20, "EK-005": 8, "EK-007": 6, "EK-203": 9, "EK-075": 16}
+FREE_SEATS = {"EK-003": 20, "EK-005": 8, "EK-007": 6, "EK-203": 9, "EK-075": 16, "EK-513": 30, "EK-386": 20}
 OTHER_TRAVELLERS = 12  # 'EXT' seats per flight, just so seat maps look realistic
 
 # ---------- The 45 passengers who miss their connection ----------
@@ -140,7 +146,9 @@ MISSED = [
     ("EK-201", "JFK", 12, ["UM", "WCHR", "INF", "INF"]),
     ("EK-073", "CDG", 15, ["WCHR"]),
 ]
-MADE = [("EK-511", "BOM", 70), ("EK-384", "HKG", 60), ("EK-412", "SYD", 55), ("EK-061", "HAM", 50)]  # 235
+# Passengers who make their connection in the brief's scenario (235). Longer what-if delays can break these too.
+MADE = [("EK-511", "BOM", 70, ["WCHR", "INF", "UM"]), ("EK-384", "HKG", 60, ["MEDA", "WCHR"]),
+        ("EK-412", "SYD", 55, ["INF"]), ("EK-061", "HAM", 50, ["WCHR"])]
 
 NEEDS = {"MEDA": "medical oxygen on board", "UM": "unaccompanied minor, age 9",
          "WCHR": "wheelchair to aircraft seat", "INF": "travelling with an infant", "STANDARD": ""}
@@ -190,8 +198,21 @@ def seat_numbers(n):
     return [f"{10 + i // len(letters)}{letters[i % len(letters)]}" for i in range(n)]
 
 
-def build(path=DB_PATH):
-    """Delete and rebuild the database from scratch. Returns the path."""
+# ---------- What-if scenario settings (the defaults ARE the brief's scenario) ----------
+DEFAULT_SCENARIO = {
+    "delay_min": 75,             # how late EK-812 lands (scheduled 09:00)
+    "crew_duty_left_min": 20,    # legal duty the inbound crew has left at landing
+    "maintenance_open": True,    # is hydraulic inspection M-1001 still open?
+    "seats_factor": 1.0,         # x free seats on the rebooking options
+}
+EK812_SCHED_ARR = "2026-11-20 09:00"
+
+
+def build(path=DB_PATH, **settings):
+    """Delete and rebuild the database for a scenario. With no settings it is exactly the
+    brief's scenario (75 min late, crew 20 min from the limit, M-1001 open). Returns the path."""
+    s = {**DEFAULT_SCENARIO, **settings}
+    landed = to_time(EK812_SCHED_ARR) + timedelta(minutes=int(s["delay_min"]))   # = the scenario clock
     path = Path(path)
     rng = random.Random(SEED)
     conn = sqlite3.connect(path)
@@ -202,7 +223,16 @@ def build(path=DB_PATH):
         conn.execute(f'DROP {kind.upper()} IF EXISTS "{name}"')
     conn.commit()
     conn.executescript(SCHEMA)
-    conn.executemany("INSERT INTO flights VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", FLIGHTS)
+    conn.executemany("INSERT INTO scenario VALUES (?,?)",
+                     [(k, str(v)) for k, v in s.items()] + [("now", landed.strftime(TIME_FMT))])
+
+    flights = []
+    for f in FLIGHTS:
+        if f[0] == "EK-812":   # the late aircraft: shift its departure and arrival by the delay
+            dep = to_time(f[6]) + timedelta(minutes=int(s["delay_min"]))
+            f = f[:7] + (dep.strftime(TIME_FMT), f[8], landed.strftime(TIME_FMT)) + f[10:]
+        flights.append(f)
+    conn.executemany("INSERT INTO flights VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", flights)
 
     # Passengers: 45 missed (with fixed vulnerable tiers) + 235 who make it
     passengers, n = [], 0
@@ -220,10 +250,11 @@ def build(path=DB_PATH):
             n += 1
             tier = tiers[i] if i < len(tiers) else "STANDARD"
             passengers.append((f"P{n:03d}", new_name(), "EK-812", flight, dest, tier, NEEDS[tier]))
-    for flight, dest, count in MADE:
-        for _ in range(count):
+    for flight, dest, count, tiers in MADE:
+        for i in range(count):
             n += 1
-            passengers.append((f"P{n:03d}", new_name(), "EK-812", flight, dest, "STANDARD", ""))
+            tier = tiers[i] if i < len(tiers) else "STANDARD"
+            passengers.append((f"P{n:03d}", new_name(), "EK-812", flight, dest, tier, NEEDS[tier]))
     rng.shuffle(passengers)  # so vulnerable passengers are not simply first in the list
     conn.executemany("INSERT INTO passengers VALUES (?,?,?,?,?,?,?)", passengers)
 
@@ -233,7 +264,7 @@ def build(path=DB_PATH):
         onward.setdefault(p[3], []).append(p[0])
     for flight_id in [f[0] for f in FLIGHTS if f[1] == "DXB"]:
         holders = sorted(onward.get(flight_id, []))
-        free = FREE_SEATS.get(flight_id, 0)
+        free = round(FREE_SEATS.get(flight_id, 0) * float(s["seats_factor"]))
         labels = seat_numbers(len(holders) + OTHER_TRAVELLERS + free)
         occupants = holders + ["EXT"] * OTHER_TRAVELLERS + [None] * free
         conn.executemany("INSERT INTO seats VALUES (?,?,?)", zip([flight_id] * len(labels), labels, occupants))
@@ -246,11 +277,26 @@ def build(path=DB_PATH):
             bags.append((f"BAG-{b:04d}", p[0], p[3], "IN_TRANSFER"))
     conn.executemany("INSERT INTO bags VALUES (?,?,?,?)", bags)
 
-    conn.executemany("INSERT INTO crew VALUES (?,?,?,?,?,?,?,?)", CREW)
-    conn.executemany("INSERT INTO maintenance_log VALUES (?,?,?,?,?,?,?)", MAINTENANCE)
+    # Crew duty is set RELATIVE to landing: inbound crew have exactly crew_duty_left_min left,
+    # standby FO Ken Ito has always already worked 9 hours.
+    max_duty = 13 * 60
+    crew = []
+    for c in CREW:
+        if c[3] == "INBOUND":
+            start = landed - timedelta(minutes=max_duty - int(s["crew_duty_left_min"]))
+            c = c[:7] + (start.strftime(TIME_FMT),)
+        elif c[0] == "S-205":
+            c = c[:7] + ((landed - timedelta(hours=9)).strftime(TIME_FMT),)
+        crew.append(c)
+    conn.executemany("INSERT INTO crew VALUES (?,?,?,?,?,?,?,?)", crew)
+
+    maintenance = list(MAINTENANCE)
+    if str(s["maintenance_open"]) in ("False", "0"):   # what-if: inspection already signed off
+        maintenance[0] = MAINTENANCE[0][:4] + ("SIGNED_OFF", "Eng. on duty (before arrival)", landed.strftime(TIME_FMT))
+    conn.executemany("INSERT INTO maintenance_log VALUES (?,?,?,?,?,?,?)", maintenance)
     conn.executemany("INSERT INTO gates VALUES (?,?,?)", GATES)
     conn.executemany("INSERT INTO gate_bookings VALUES (?,?,?,?)", GATE_BOOKINGS)
-    append_audit(conn, NOW.strftime(TIME_FMT), "CODE", "database_built", f"seed {SEED}", "ok")
+    append_audit(conn, landed.strftime(TIME_FMT), "CODE", "database_built", f"seed {SEED}, scenario {s}", "ok")
     conn.commit()
     conn.close()
     return path
@@ -268,6 +314,19 @@ def connect(path=DB_PATH):
 
 def to_time(text):
     return datetime.strptime(text, TIME_FMT)
+
+
+def scenario(conn):
+    """The settings this database was built with. s["now"] is the scenario clock (a datetime)."""
+    try:
+        rows = dict(conn.execute("SELECT key, value FROM scenario").fetchall())
+    except sqlite3.OperationalError:          # database from before the what-if feature
+        rows = {}
+    s = {**DEFAULT_SCENARIO, **rows}
+    return {"delay_min": int(s["delay_min"]), "crew_duty_left_min": int(s["crew_duty_left_min"]),
+            "maintenance_open": str(s["maintenance_open"]) not in ("False", "0"),
+            "seats_factor": float(s["seats_factor"]),
+            "now": to_time(rows["now"]) if "now" in rows else NOW}
 
 
 # ---------- Integrity checks (used by tests and shown live in the console) ----------
