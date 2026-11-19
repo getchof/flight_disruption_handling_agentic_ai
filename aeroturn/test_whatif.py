@@ -48,9 +48,9 @@ def test_long_delay_breaks_mumbai_and_offers_a_new_flight():
 
 def test_crew_duty_setting_drives_the_crew_guard():
     tired = build(crew_duty_left_min=20)
-    assert not any(c["legal_for_EK-813"] for c in tired["crew_on_EK-813"])
+    assert not any(c["legal_for_outbound"] for c in tired["crew_on_outbound"])
     rested = build(delay_min=30, crew_duty_left_min=600)
-    assert all(c["legal_for_EK-813"] for c in rested["crew_on_EK-813"])
+    assert all(c["legal_for_outbound"] for c in rested["crew_on_outbound"])
     assert T.find_legal_standby_crew("EK-813")["replace"] == []
 
 
@@ -74,9 +74,9 @@ def test_seat_factor_changes_supply():
 
 def test_costs_adapt():
     build(delay_min=30, crew_duty_left_min=600, maintenance_open=False)
-    opts = costs.get_recovery_options()
+    opts = costs.get_recovery_options("EK-813")
     assert [o["id"] for o in opts["options"]] == ["A", "C"], "no 'wait for crew rest' when the crew is legal"
-    assert opts["options"][0]["total_eur"] == 0 and opts["options"][0]["ek813_delay_min"] == 0
+    assert opts["options"][0]["total_eur"] == 0 and opts["options"][0]["delay_min"] == 0
 
 
 def test_rollback_and_integrity_hold_in_any_scenario():

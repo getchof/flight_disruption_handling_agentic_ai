@@ -1,8 +1,11 @@
 """
 AeroTurn - the services the agent can call, plus the human actions.  [CODE, not AI]
 
+Works for ANY late inbound flight at the hub: disruptions() finds them, and the aircraft's
+next flight is found by its registration (same tail number, next departure from the hub).
+
 AGENT TOOLS (the LLM may call these; type hints + docstrings are what it reads):
-  get_turnaround_and_crew_state()        read-only picture of the disruption
+  get_turnaround_and_crew_state(inbound) read-only picture of one disruption
   execute_atomic_passenger_rebook(...)   seats + bags in ONE SQLite transaction, full rollback on failure
   stage_controller_schedule_change(...)  departure / delay / crew swap / gate change -> guards -> approval queue
   send_passenger_notification(...)       message whose facts are written by code
@@ -74,11 +77,56 @@ def _maintenance(conn, reg):
     return [dict(r) for r in conn.execute("SELECT * FROM maintenance_log WHERE aircraft_reg=?", (reg,))]
 
 
+def _inbound_for(conn, outbound):
+    """The flight that brings the aircraft for `outbound` to the hub: same registration, the
+    latest scheduled arrival at the hub before the outbound's scheduled departure."""
+    row = conn.execute("SELECT * FROM flights WHERE aircraft_reg=? AND destination=? AND sched_arr<=? "
+                       "ORDER BY sched_arr DESC LIMIT 1",
+                       (outbound["aircraft_reg"], db.HUB, outbound["sched_dep"])).fetchone()
+    return dict(row) if row else None
+
+
+def _outbound_for(conn, inbound):
+    """The aircraft's next flight after `inbound`: same registration, the first scheduled
+    departure from the hub after the inbound's scheduled arrival."""
+    row = conn.execute("SELECT * FROM flights WHERE aircraft_reg=? AND origin=? AND sched_dep>=? "
+                       "ORDER BY sched_dep LIMIT 1",
+                       (inbound["aircraft_reg"], db.HUB, inbound["sched_arr"])).fetchone()
+    return dict(row) if row else None
+
+
 def _inbound_arrival(conn, flight):
     """Landing time of the aircraft that will operate `flight` (same registration)."""
-    row = conn.execute("SELECT est_arr FROM flights WHERE aircraft_reg=? AND destination='DXB'",
-                       (flight["aircraft_reg"],)).fetchone()
-    return db.to_time(row["est_arr"]) if row else _now()
+    inbound = _inbound_for(conn, flight)
+    return db.to_time(inbound["est_arr"]) if inbound else _now()
+
+
+def _delay_min(flight):
+    return int((db.to_time(flight["est_arr"]) - db.to_time(flight["sched_arr"])).total_seconds() // 60)
+
+
+def disruptions():
+    """Every late inbound flight at the hub, with the aircraft's next flight and how many
+    passengers miss their connection. Code finds these; the AI is then pointed at one."""
+    conn = _conn()
+    missed = db.missed_connections(conn)
+    out = []
+    for r in conn.execute("SELECT * FROM flights WHERE destination=? AND est_arr>sched_arr ORDER BY est_arr",
+                          (db.HUB,)):
+        inbound = dict(r)
+        outbound = _outbound_for(conn, inbound)
+        out.append({"inbound": inbound["flight_id"], "route": f"{inbound['origin']}-{inbound['destination']}",
+                    "delay_min": _delay_min(inbound), "outbound": outbound["flight_id"] if outbound else None,
+                    "missed_connections": sum(p["inbound_flight"] == inbound["flight_id"] for p in missed)})
+    return out
+
+
+def resolve_inbound(conn, inbound_flight=None):
+    """Which disruption a call is about: the flight given, or the only late inbound if there is one."""
+    if inbound_flight:
+        return _flight(conn, inbound_flight)
+    late = disruptions()
+    return _flight(conn, late[0]["inbound"]) if len(late) == 1 else None
 
 
 def _floor_departure(conn, flight):
@@ -138,7 +186,7 @@ def _crew_minutes(conn, flight):
     return max([p["minutes_away"] for p in picks] + [c["minutes_away"] for c in kept if c["crew_id"]])
 
 
-def turnaround_plan_for(flight_id="EK-813"):
+def turnaround_plan_for(flight_id):
     """Critical-path plan for a turnaround, from the live data (used by the console)."""
     conn = _conn()
     flight = _flight(conn, flight_id)
@@ -164,8 +212,8 @@ def _options(conn, destination, arrival):
     """Onward flights to a destination with free seats and whether a connection is possible."""
     rows = conn.execute(
         "SELECT f.flight_id, f.est_dep, SUM(s.occupant IS NULL) AS free FROM flights f "
-        "JOIN seats s ON s.flight_id = f.flight_id WHERE f.origin='DXB' AND f.destination=? "
-        "GROUP BY f.flight_id ORDER BY f.est_dep", (destination,)).fetchall()
+        "JOIN seats s ON s.flight_id = f.flight_id WHERE f.origin=? AND f.destination=? "
+        "GROUP BY f.flight_id ORDER BY f.est_dep", (db.HUB, destination)).fetchall()
     out = []
     for r in rows:
         problem = g.check_connection(arrival, db.to_time(r["est_dep"]))
@@ -225,14 +273,20 @@ def write_gateway(action, actor, request, apply, recheck=None):
 # =====================================================================
 # AGENT TOOL 1: read-only state
 # =====================================================================
-def get_turnaround_and_crew_state() -> dict:
-    """Get the full disruption picture: the late inbound flight, the outbound flight it must
-    operate, crew legal duty left, maintenance items, gate situation, passengers who miss
-    their connection (vulnerable passengers first) with their rebooking options, and any
-    changes waiting for Operations Controller approval."""
+def get_turnaround_and_crew_state(inbound_flight: str = "") -> dict:
+    """Get the full disruption picture for one late inbound flight: the inbound, the outbound
+    flight the same aircraft must operate next, crew legal duty left, maintenance items, gate
+    situation, passengers who miss their connection (vulnerable passengers first) with their
+    rebooking options, and any changes waiting for Operations Controller approval."""
     conn = _conn()
-    inbound = _flight(conn, "EK-812")
-    outbound = _flight(conn, "EK-813")
+    inbound = resolve_inbound(conn, inbound_flight)
+    if not inbound or inbound["destination"] != db.HUB:
+        return {"status": "error", "error": f"{inbound_flight or 'No flight given'} is not a known inbound flight to "
+                                            f"{db.HUB}. Late inbound flights: {[d['inbound'] for d in disruptions()]}"}
+    outbound = _outbound_for(conn, inbound)
+    if not outbound:
+        return {"status": "error", "error": f"No next departure found for aircraft {inbound['aircraft_reg']}"}
+    out_id = outbound["flight_id"]
     arrival = db.to_time(inbound["est_arr"])
     earliest = _earliest_departure(conn, outbound)
     planned = max(db.to_time(outbound["est_dep"]), earliest)
@@ -243,31 +297,36 @@ def get_turnaround_and_crew_state() -> dict:
         return {"crew_id": c["crew_id"], "name": c["name"], "role": c["role"], "status": c["status"],
                 "location": c["location"], "minutes_away": c["minutes_away"],
                 "duty_min_left_now": round(g.duty_minutes_left(start, _now(), _now())),
-                "legal_for_EK-813": not problems}
+                "legal_for_outbound": not problems}
 
-    crew = [crew_row(c) for c in conn.execute("SELECT * FROM crew WHERE assigned_flight='EK-813'")]
+    crew = [crew_row(c) for c in conn.execute("SELECT * FROM crew WHERE assigned_flight=?", (out_id,))]
     standby = sorted((crew_row(c) for c in conn.execute("SELECT * FROM crew WHERE status='STANDBY'")),
-                     key=lambda c: (not c["legal_for_EK-813"], c["minutes_away"]))
+                     key=lambda c: (not c["legal_for_outbound"], c["minutes_away"]))
 
-    missed = sorted(db.missed_connections(conn), key=lambda p: (g.PRIORITY_RANK[p["tier"]], p["passenger_id"]))
+    missed = sorted((p for p in db.missed_connections(conn) if p["inbound_flight"] == inbound["flight_id"]),
+                    key=lambda p: (g.PRIORITY_RANK[p["tier"]], p["passenger_id"]))
     options = {dest: _options(conn, dest, arrival) for dest in sorted({p["final_destination"] for p in missed})}
 
     gate = outbound["gate"]
-    gate_problem = g.check_gate({"gate_id": gate, "wide_body": 1}, outbound["body"], _now(), planned,
-                                _gate_bookings(conn, gate, except_flight="EK-813"))
+    gate_row = conn.execute("SELECT * FROM gates WHERE gate_id=?", (gate,)).fetchone()
+    gate_problem = g.check_gate(dict(gate_row) if gate_row else {"gate_id": gate, "wide_body": 1}, outbound["body"],
+                                _now(), planned, _gate_bookings(conn, gate, except_flight=out_id))
     pending = [dict(r) for r in conn.execute(
-        "SELECT approval_id, kind, payload, status FROM pending_approvals WHERE status='PENDING'")]
+        "SELECT approval_id, kind, payload, status FROM pending_approvals WHERE status='PENDING'")
+        if json.loads(r["payload"]).get("flight_id") == out_id]
     return {
         "now": _ts(),
-        "inbound": {"flight": "EK-812", "route": "BKK-DXB", "aircraft": f"{inbound['aircraft_reg']} {inbound['aircraft_type']}",
+        "inbound": {"flight": inbound["flight_id"], "route": f"{inbound['origin']}-{inbound['destination']}",
+                    "aircraft": f"{inbound['aircraft_reg']} {inbound['aircraft_type']}",
                     "scheduled_arrival": inbound["sched_arr"][-5:], "actual_arrival": inbound["est_arr"][-5:],
-                    "delay_min": int((arrival - db.to_time(inbound["sched_arr"])).total_seconds() // 60)},
-        "outbound": {"flight": "EK-813", "route": "DXB-MAN", "scheduled_departure": outbound["sched_dep"][-5:],
+                    "delay_min": _delay_min(inbound)},
+        "outbound": {"flight": out_id, "route": f"{outbound['origin']}-{outbound['destination']}",
+                     "scheduled_departure": outbound["sched_dep"][-5:],
                      "current_departure": outbound["est_dep"][-5:], "status": outbound["status"],
                      "earliest_legal_departure": _hhmm(earliest), "block_min": outbound["block_min"],
-                     "turnaround_critical_path": " -> ".join(turnaround_plan_for("EK-813")["critical_path"]),
+                     "turnaround_critical_path": " -> ".join(turnaround_plan_for(out_id)["critical_path"]),
                      "gate": gate, "gate_problem": gate_problem},
-        "crew_on_EK-813": crew,
+        "crew_on_outbound": crew,
         "standby_crew": standby,
         "maintenance": [{k: m[k] for k in ("item_id", "description", "mandatory", "status")}
                         for m in _maintenance(conn, outbound["aircraft_reg"])],
@@ -304,10 +363,14 @@ def execute_atomic_passenger_rebook(passenger_ids: list[str], new_flight: str) -
     if len(set(passenger_ids)) != len(passenger_ids):
         violations.append("The same passenger appears twice in the batch")
     batch = [missed[pid] for pid in dict.fromkeys(passenger_ids) if pid in missed]
-    arrival = db.to_time(_flight(conn, "EK-812")["est_arr"])
+    # Each passenger's own inbound flight decides when they can connect (batches may mix disruptions).
+    arrivals = {p["passenger_id"]: db.to_time(_flight(conn, p["inbound_flight"])["est_arr"]) for p in batch}
+    arrival = max(arrivals.values(), default=_now())   # latest lander in the batch: the conservative choice
     violations += [f"{p['passenger_id']} goes to {p['final_destination']}, {new_flight} goes to {flight['destination']}"
                    for p in batch if p["final_destination"] != flight["destination"]]
-    violations += g.check_connection(arrival, db.to_time(flight["est_dep"]))
+    for v in dict.fromkeys(x for p in batch for x in g.check_connection(arrivals[p["passenger_id"]],
+                                                                      db.to_time(flight["est_dep"]))):
+        violations.append(v)
     free = conn.execute("SELECT COUNT(*) FROM seats WHERE flight_id=? AND occupant IS NULL", (new_flight,)).fetchone()[0]
     if len(batch) > free:
         violations.append(f"SEATS: batch of {len(batch)} but {new_flight} has only {free} free seat(s)")
@@ -371,17 +434,22 @@ def _pending_gate_change(conn, flight_id):
     return None
 
 
-def chosen_plan(conn=None):
-    """The recovery option (A/B/C) the controller chose for EK-813, or None."""
-    row = (conn or _conn()).execute("SELECT detail FROM audit_log WHERE action='recovery_plan_selected' "
-                                    "ORDER BY id DESC LIMIT 1").fetchone()
-    return row[0] if row else None
+def chosen_plan(conn, flight_id):
+    """The recovery option (A/B/C) the controller chose for this outbound flight, or None."""
+    for r in conn.execute("SELECT detail FROM audit_log WHERE action='recovery_plan_selected' ORDER BY id DESC"):
+        try:
+            sel = json.loads(r[0])
+        except ValueError:        # older rows stored just the option letter (single-flight version)
+            sel = {"flight_id": "EK-813", "option": r[0]}
+        if sel.get("flight_id") == flight_id:
+            return sel["option"]
+    return None
 
 
-def approved_changes(conn=None, flight_id="EK-813"):
+def approved_changes(conn, flight_id):
     """Changes for a flight that a controller has already approved (= option A is being executed)."""
-    rows = (conn or _conn()).execute("SELECT approval_id, kind, payload FROM pending_approvals "
-                                     "WHERE status='APPROVED' ORDER BY approval_id").fetchall()
+    rows = conn.execute("SELECT approval_id, kind, payload FROM pending_approvals "
+                        "WHERE status='APPROVED' ORDER BY approval_id").fetchall()
     return [f"#{r['approval_id']} {r['kind']}" for r in rows if json.loads(r["payload"])["flight_id"] == flight_id]
 
 
@@ -395,9 +463,9 @@ def _check_change(conn, kind, flight_id, new_time, gate, crew_in):
 
     # Plan consistency: crew swap / gate / delay / departure belong to option A. If the controller
     # chose option B (wait for crew rest) or C (cancel), these changes would contradict that decision.
-    plan = chosen_plan(conn)
-    if flight_id == "EK-813" and plan in ("B", "C"):
-        return [f"PLAN: the controller chose option {plan} for EK-813; a {kind} belongs to option A and "
+    plan = chosen_plan(conn, flight_id)
+    if plan in ("B", "C"):
+        return [f"PLAN: the controller chose option {plan} for {flight_id}; a {kind} belongs to option A and "
                 f"would contradict that decision"], dep
 
     if kind == "DEPARTURE":
@@ -485,14 +553,15 @@ def send_passenger_notification(passenger_ids: list[str], note: str) -> dict:
             continue
         seat = conn.execute("SELECT s.flight_id, s.seat_no, f.est_dep FROM seats s JOIN flights f "
                             "ON f.flight_id=s.flight_id WHERE s.occupant=?", (pid,)).fetchone()
+        inbound = p["inbound_flight"]
         if seat and seat["flight_id"] != p["original_onward"]:
-            facts = (f"EK-812 landed late. You are rebooked on {seat['flight_id']} to {p['final_destination']}, "
+            facts = (f"{inbound} landed late. You are rebooked on {seat['flight_id']} to {p['final_destination']}, "
                      f"seat {seat['seat_no']}, departing {seat['est_dep'][-5:]}. Your bags go with you.")
         elif pid in {m["passenger_id"] for m in db.missed_connections(conn)}:
-            facts = (f"EK-812 landed late and you will miss {p['original_onward']}. Our team is arranging your "
+            facts = (f"{inbound} landed late and you will miss {p['original_onward']}. Our team is arranging your "
                      f"onward travel and will meet you at the transfer desk.")
         else:
-            facts = f"EK-812 landed late, but your connection {p['original_onward']} is still on time."
+            facts = f"{inbound} landed late, but your connection {p['original_onward']} is still on time."
         if p["tier"] != "STANDARD":
             facts += f" Assistance ({p['needs']}) will meet you at the aircraft door."
         sent[pid] = facts + (f" {note.strip()}" if note and not any(f in note for f in ("EK-", "seat ")) else "")

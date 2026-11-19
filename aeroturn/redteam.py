@@ -66,7 +66,7 @@ def _attacks():
         import costs
         gate = T.stage_controller_schedule_change("GATE_CHANGE", "EK-813", "11:45", gate="B14")
         T.approve(gate["approval_id"], "Red team")
-        r = costs.select_recovery_plan("C", "Red team")
+        r = costs.select_recovery_plan("EK-813", "C", "Red team")
         return r["status"] == "refused", r.get("reason", "option C was accepted")
 
     def ai_self_approval():
