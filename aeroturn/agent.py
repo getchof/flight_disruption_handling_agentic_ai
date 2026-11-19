@@ -508,6 +508,7 @@ def run_agent(message, on_step=None, only=None, local_only=False, inbound_flight
     if not disruption:
         return f"Nothing was done: {problem}."
     CURRENT["inbound"] = disruption["inbound"]
+    T.hold_missed_bags()   # CODE, before the AI: bags of missed connections wait at the hub
 
     chain = available_providers(only, local_only)
     if not chain:

@@ -560,6 +560,8 @@ def send_passenger_notification(passenger_ids: list[str], note: str) -> dict:
         elif pid in {m["passenger_id"] for m in db.missed_connections(conn)}:
             facts = (f"{inbound} landed late and you will miss {p['original_onward']}. Our team is arranging your "
                      f"onward travel and will meet you at the transfer desk.")
+            if conn.execute("SELECT 1 FROM bags WHERE passenger_id=? AND status='HELD'", (pid,)).fetchone():
+                facts += f" Your bags are held safely in {db.HUB} and will travel with you on your new flight."
         else:
             facts = f"{inbound} landed late, but your connection {p['original_onward']} is still on time."
         if p["tier"] != "STANDARD":
@@ -572,6 +574,30 @@ def send_passenger_notification(passenger_ids: list[str], note: str) -> dict:
         return {"status": "sent", "count": len(sent), "messages": sent, "summary": f"{len(sent)} sent"}
 
     return write_gateway("notifications_sent", "CODE", {"passenger_ids": passenger_ids}, apply)
+
+
+# =====================================================================
+# CODE step (not an agent tool): hold the bags of passengers who missed their connection
+# =====================================================================
+def hold_missed_bags():
+    """A missed connection means the bags missed it too: they must not stay routed to a flight
+    the passenger is not on. Hold them at the hub (status HELD, no flight) until the passenger
+    is rebooked; execute_atomic_passenger_rebook then routes them to the new flight.
+    Idempotent: writes (and audits) only when there is something new to hold."""
+    conn = _conn()
+    missed = db.missed_connections(conn)
+    tags = [r["bag_tag"] for p in missed for r in conn.execute(
+        "SELECT bag_tag FROM bags WHERE passenger_id=? AND routed_to=? AND status<>'HELD'",
+        (p["passenger_id"], p["original_onward"]))]
+    if not tags:
+        return {"status": "ok", "held": 0}
+
+    def apply(tx, progress):
+        tx.executemany("UPDATE bags SET routed_to=NULL, status='HELD' WHERE bag_tag=?", [(t,) for t in tags])
+        progress["done"] = len(tags)
+        return {"status": "held", "held": len(tags), "summary": f"{len(tags)} bags held at {db.HUB}"}
+
+    return write_gateway("bags_held", "CODE", {"bags": len(tags)}, apply)
 
 
 # =====================================================================
@@ -701,6 +727,7 @@ def verified_facts():
         "awaiting_approval": pending,
         "open_mandatory_maintenance": [r["item_id"] for r in conn.execute(
             "SELECT item_id FROM maintenance_log WHERE mandatory=1 AND status<>'SIGNED_OFF'")],
+        "bags_held": conn.execute("SELECT COUNT(*) FROM bags WHERE status='HELD'").fetchone()[0],
         "integrity": integrity(conn),
     }
 
@@ -708,6 +735,7 @@ def verified_facts():
 def reset(**settings):
     """Rebuild the database (console buttons). No settings = the brief's scenario."""
     db.build(DB, **settings)
+    hold_missed_bags()
 
 
 def current_settings():

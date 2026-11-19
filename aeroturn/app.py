@@ -232,6 +232,7 @@ def act_pick_preset():
 # Layout
 # =====================================================================
 # ---------- Which disruption? Code finds every late inbound flight; the controller picks one ----------
+T.hold_missed_bags()   # idempotent: holds bags of any newly missed connection, else does nothing
 late = T.disruptions()
 if not late:
     st.info(f"No late inbound flights at {db.HUB}. Press Reset to reload the scenario.")
@@ -431,6 +432,7 @@ def draw_brief():
                 [f"- **Unresolved ({len(f['unresolved'])})**: {', '.join(f['unresolved']) or 'none'}",
                  f"- **Awaiting approval**: " + (", ".join(f"#{x['approval_id']} {x['kind']}" for x in f["awaiting_approval"]) or "none"),
                  f"- **Open mandatory maintenance**: {', '.join(f['open_mandatory_maintenance']) or 'none'}",
+                 f"- **Bags held at {db.HUB}** (owner not yet rebooked): {f['bags_held']}",
                  f"- **Integrity**: {f['integrity']['double_bookings']} double bookings, {f['integrity']['orphan_bags']} orphan bags"]))
         st.divider()
 

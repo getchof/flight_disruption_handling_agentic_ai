@@ -252,6 +252,33 @@ def test_notifications_use_real_facts():
     assert "arranging your onward travel" in r["messages"][waiting]
 
 
+# ---------- Bags of passengers who missed their connection ----------
+def test_missed_connection_bags_are_held_until_rebooked():
+    conn = fresh()
+    s = T.get_turnaround_and_crew_state()
+    missed_ids = missed(s)
+    bag_count = lambda where, *a: conn.execute(f"SELECT COUNT(*) FROM bags WHERE {where}", a).fetchone()[0]
+    expected = sum(bag_count("passenger_id=?", pid) for pid in missed_ids)
+
+    r = T.hold_missed_bags()
+    assert r["held"] == expected and bag_count("status='HELD'") == expected, r
+    assert bag_count("status='HELD' AND routed_to IS NOT NULL") == 0, "held bags are routed to no flight"
+    assert T.hold_missed_bags()["held"] == 0, "idempotent: nothing new to hold"
+    assert T.integrity(conn) == {"double_bookings": 0, "orphan_bags": 0}
+
+    vul = missed(s, "LHR", vulnerable=True)                       # rebooking releases their bags
+    T.execute_atomic_passenger_rebook(vul, "EK-005")
+    for pid in vul:
+        assert {tuple(b) for b in conn.execute("SELECT routed_to, status FROM bags WHERE passenger_id=?", (pid,))} \
+            == {("EK-005", "IN_TRANSFER")}
+    assert T.verified_facts()["bags_held"] == expected - sum(bag_count("passenger_id=?", pid) for pid in vul)
+
+    waiting = missed(s, "JFK")[0]                                 # unresolved: told their bags are safe
+    msg = T.send_passenger_notification([waiting], "")["messages"][waiting]
+    assert "bags are held safely in DXB" in msg, msg
+    assert T.integrity(conn) == {"double_bookings": 0, "orphan_bags": 0}
+
+
 # ---------- Any flight, not just EK-812: a second, different disruption at the same time ----------
 def add_second_disruption(conn):
     """EK-433 from Singapore lands 70 min late; its aircraft A6-ENX next flies EK-441 to Mumbai.
