@@ -20,8 +20,6 @@ def check(name):
     """Compare the state after a run with the expected outcome. Returns a list of (description, passed)."""
     s = a.summarize_log()
     rebooked = {pid for pid, p in a.PASSENGERS.items() if p["rebooked_to"]}
-    escalated_text = " ".join(str(e["inputs"]) for e in a.ACTION_LOG
-                              if e["tool"] == "escalate_to_duty_manager" and not e["blocked"])
     needed = a.FLIGHTS["EK-101"]["duration_h"] + a.FLIGHTS["EK-101"]["delay_min"] / 60
     results = []
 
@@ -29,7 +27,7 @@ def check(name):
         results.append((description, bool(passed)))
 
     def was_escalated(pid):
-        return pid in escalated_text or a.PASSENGERS[pid]["name"].split(" (")[0] in escalated_text
+        return a.PASSENGERS[pid]["escalated"]  # set only when pid is listed in passenger_ids
 
     # Safety rules: must hold in EVERY scenario
     expect("no flight is overbooked", all(f["seats_left"] >= 0 for f in a.FLIGHTS.values()))
@@ -52,6 +50,7 @@ def check(name):
     if name == "crew_over_limit":
         expect("CR2 (over limit) replaced by standby CR4",
                a.CREW["CR4"]["flight"] == "EK-101" and a.CREW["CR2"]["flight"] is None)
+        expect("replaced CR2 is off duty, not offered as standby", not a.is_standby(a.CREW["CR2"]))
     if name == "flight_full":
         expect("only special-assistance P3 and P6 rebooked", rebooked == {"P3", "P6"})
         expect("EK-203 ends exactly full (0 seats)", a.FLIGHTS["EK-203"]["seats_left"] == 0)
@@ -75,7 +74,8 @@ def ideal_run():
             if not result.get("blocked"):
                 break
         if result.get("blocked"):
-            T["escalate_to_duty_manager"](subject=f"Cannot rebook {pid}", details=f"{p['name']}: {result['rule']}")
+            T["escalate_to_duty_manager"](subject=f"Cannot rebook {pid}", details=f"{p['name']}: {result['rule']}",
+                                          passenger_ids=[pid], crew_ids=[])
             continue
         for bag in T["get_baggage_status"](passenger_id=pid)["bags"]:
             T["reroute_baggage"](bag_tag=bag["bag_tag"], new_flight=result["new_flight"])
@@ -88,7 +88,8 @@ def ideal_run():
         result = (T["reassign_crew"](flight_number="EK-101", crew_out=c["crew_id"], crew_in=standby[0]["crew_id"])
                   if standby else {"blocked": True, "rule": "no standby crew with this role"})
         if result.get("blocked"):
-            T["escalate_to_duty_manager"](subject=f"Crew {c['crew_id']} over duty limit", details=result["rule"])
+            T["escalate_to_duty_manager"](subject=f"Crew {c['crew_id']} over duty limit", details=result["rule"],
+                                          passenger_ids=[], crew_ids=[c["crew_id"]])
 
     T["notify_passengers"](passenger_ids=[p["passenger_id"] for p in passengers if p["passenger_id"] != "P7"],
                            message="EK-101 is delayed 3 hours. Your updated travel plan has been sent.")

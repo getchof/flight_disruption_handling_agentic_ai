@@ -5,7 +5,7 @@ Scenario: flight EK-101 (DXB -> LHR) is delayed 3 hours. The agent finds the
 connecting passengers, rebooks them, reroutes their bags, checks crew duty
 limits, notifies passengers and escalates risky cases to a duty manager.
 
-Same pattern as code.py: Gemini decides which tools to call, but every
+Same pattern as refund_agent.py: Gemini decides which tools to call, but every
 safety/business rule is enforced IN CODE inside the action tools, so the
 model cannot skip a rule even if it tries.
 
@@ -151,6 +151,10 @@ def load_scenario(name="normal"):
     for p in PASSENGERS.values():
         p["rebooked_to"] = None
         p["notified"] = False
+        p["escalated"] = False
+    for c in CREW.values():
+        c["off_duty"] = False   # True once replaced: not on a flight, but not standby either
+        c["escalated"] = False
     for table, key, field, value in SCENARIOS[name]["changes"]:
         tables[table][key][field] = value
     ACTION_LOG.clear()
@@ -178,6 +182,11 @@ def misses_connection(p):
         return False
     gap = minutes_between(new_arrival(p["flight"]), new_departure(p["connection"]))
     return gap < MIN_CONNECTION_MIN
+
+
+def is_standby(c):
+    """Standby = not on a flight and not taken off duty after being replaced."""
+    return c["flight"] is None and not c.get("off_duty")
 
 
 def blocked(rule, next_step):
@@ -267,7 +276,7 @@ def check_crew_duty(flight_number: str) -> dict:
              "hours_needed": needed, "legal": c["duty_hours_left"] >= needed}
             for cid, c in CREW.items() if c["flight"] == flight_number]
     standby = [{"crew_id": cid, "name": c["name"], "role": c["role"], "duty_hours_left": c["duty_hours_left"]}
-               for cid, c in CREW.items() if c["flight"] is None]
+               for cid, c in CREW.items() if is_standby(c)]
     return {"flight": flight_number, "hours_needed": needed, "crew": crew, "standby": standby}
 
 
@@ -284,8 +293,15 @@ def rebook_passenger(passenger_id: str, new_flight: str) -> dict:
                          f"Use find_alternative_flights first."}
     if p["rebooked_to"]:
         return blocked(f"{passenger_id} is already rebooked to {p['rebooked_to']}", "no action needed")
+    hub = FLIGHTS[p["flight"]]["destination"]
+    if f["origin"] != hub:
+        return blocked(f"{new_flight} does not leave from {hub}, where {p['flight']} lands", "pick another flight")
     if f["destination"] != p["final_destination"]:
         return blocked(f"{new_flight} does not go to {p['final_destination']}", "pick another flight")
+    if not misses_connection(p):
+        why = (f"{passenger_id}'s trip ends at {hub}" if not p["connection"]
+               else f"{passenger_id} still makes their connection {p['connection']}")
+        return blocked(f"{why}, so no rebooking is needed", "notify_passengers with a delay notice")
 
     # Rule: safety-critical -> human. An unaccompanied minor's new itinerary needs a duty manager.
     if p["unaccompanied_minor"]:
@@ -314,6 +330,7 @@ def rebook_passenger(passenger_id: str, new_flight: str) -> dict:
 
     f["seats_left"] -= 1
     p["rebooked_to"] = new_flight
+    p["notified"] = False  # any earlier notice is now out of date: they must get the new plan
     return {"status": "rebooked", "passenger_id": passenger_id, "new_flight": new_flight,
             "departure": to_text(new_departure(new_flight)), "seats_left_now": f["seats_left"]}
 
@@ -367,7 +384,7 @@ def reassign_crew(flight_number: str, crew_out: str, crew_in: str) -> dict:
     if out["role"] in SAFETY_CRITICAL_ROLES:
         return blocked(f"replacing the {out['role']} is safety-critical", "escalate_to_duty_manager")
 
-    if inn["flight"] is not None:
+    if not is_standby(inn):
         return blocked(f"{crew_in} is not on standby", "pick a standby crew member")
     if inn["role"] != out["role"]:
         return blocked(f"{crew_in} is a {inn['role']}, need a {out['role']}", "pick a matching role")
@@ -378,6 +395,7 @@ def reassign_crew(flight_number: str, crew_out: str, crew_in: str) -> dict:
                        "escalate_to_duty_manager (no legal replacement)")
 
     out["flight"], inn["flight"] = None, flight_number
+    out["off_duty"] = True  # over the limit: must not show up as standby for another flight
     return {"status": "reassigned", "flight": flight_number, "removed": crew_out, "added": crew_in}
 
 
@@ -406,22 +424,37 @@ def notify_passengers(passenger_ids: list[str], message: str) -> dict:
     sent = {}
     for pid in passenger_ids:
         p = PASSENGERS[pid]
-        # Rule: the model's note may not mention a flight this passenger is not on.
+        # Rule: the model's note may not mention a flight this passenger is not on
+        # (any spelling: EK-203, EK203, EK 203), and may not give times, because the
+        # real times come from booking_facts() and a model-written time could be wrong.
         allowed = {p["flight"], p["rebooked_to"]}
-        wrong = [fn for fn in re.findall(r"[A-Z]{2}-\d{3}", message) if fn not in allowed]
+        mentioned = {f"{a}-{n}" for a, n in re.findall(r"\b([A-Z]{2})\s?-?\s?(\d{2,4})\b", message)}
+        wrong = sorted(mentioned - allowed)
+        if re.search(r"\b\d{1,2}[:.]\d{2}\b", message):
+            wrong.append("a time")
         note = "" if wrong else message
         text = booking_facts(pid) + (f" {note}" if note else "")
         print(f"\n  NOTIFY {p['name']} ({pid})\n  {text}"
-              + (f"\n  (agent note removed: it mentioned {wrong})" if wrong else "") + "\n")
+              + (f"\n  (agent note removed: it mentioned {', '.join(wrong)})" if wrong else "") + "\n")
         p["notified"] = True
         sent[pid] = text
     return {"status": "sent", "count": len(sent), "messages": sent}
 
 
-def escalate_to_duty_manager(subject: str, details: str) -> dict:
-    """Send a risky or blocked case to the human duty manager with a clear summary."""
-    print(f"\n  ESCALATION: {subject}\n  {details}\n")
-    return {"status": "escalated", "subject": subject}
+def escalate_to_duty_manager(subject: str, details: str, passenger_ids: list[str],
+                             crew_ids: list[str]) -> dict:
+    """Send a risky or blocked case to the human duty manager with a clear summary.
+    passenger_ids and crew_ids list exactly who the duty manager must handle
+    (use [] for none). Only the IDs listed here count as escalated."""
+    unknown = [x for x in passenger_ids if x not in PASSENGERS] + [x for x in crew_ids if x not in CREW]
+    if unknown:
+        return {"error": f"Unknown IDs: {unknown}. Passenger IDs look like P1, crew IDs like CR1."}
+    for pid in passenger_ids:
+        PASSENGERS[pid]["escalated"] = True
+    for cid in crew_ids:
+        CREW[cid]["escalated"] = True
+    print(f"\n  ESCALATION: {subject}  (passengers {passenger_ids}, crew {crew_ids})\n  {details}\n")
+    return {"status": "escalated", "subject": subject, "passenger_ids": passenger_ids, "crew_ids": crew_ids}
 
 
 # ---------- Logging: every tool call goes into ACTION_LOG ----------
@@ -434,11 +467,14 @@ def logged(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
-            out = fn(*args, **kwargs)
+            inspect.signature(fn).bind(*args, **kwargs)  # check argument names before calling
         except TypeError:  # wrong argument names (common with small local models)
             out = {"error": f"Wrong arguments. Correct call: {fn.__name__}{inspect.signature(fn)}"}
-        except Exception as e:
-            out = {"error": str(e)}
+        else:
+            try:
+                out = fn(*args, **kwargs)
+            except Exception as e:  # a bug inside the tool: report it as what it is
+                out = {"error": f"{fn.__name__} failed: {type(e).__name__}: {e}"}
         is_blocked = isinstance(out, dict) and out.get("blocked", False)
         entry = {"time": datetime.now().strftime("%H:%M:%S"), "tool": fn.__name__,
                  "inputs": kwargs, "result": out, "blocked": is_blocked,
@@ -473,6 +509,9 @@ All times are UTC. When a flight is disrupted, work through these steps:
 5. If a tool result says blocked, never try to work around the rule. If its next_step
    mentions escalate_to_duty_manager, or a passenger cannot be rebooked, escalate with
    a clear summary (who, what, why), including any of their bags that were not rerouted.
+   List exactly the passengers and crew being escalated in passenger_ids and crew_ids.
+6. In notify_passengers, the message is only a short friendly note: no flight numbers
+   or times (the system adds the real ones).
 Rules (also enforced by the system): minimum connection {MIN_CONNECTION_MIN} min, bag
 transfer {MIN_BAG_CONNECTION_MIN} min, no full flights, no crew beyond duty hours,
 special-assistance priority, safety-critical cases go to a human.
@@ -483,12 +522,17 @@ escalations, and any actions blocked by rules."""
 CONFIG = types.GenerateContentConfig(
     system_instruction=SYSTEM,
     tools=TOOL_FUNCS,
-    # We run the tool loop ourselves (same as code.py) so history survives a failed call.
+    # We run the tool loop ourselves (same as refund_agent.py) so history survives a failed call.
     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
 )
 
 
-# ---------- Agent loop (same pattern as code.py) ----------
+# ---------- Agent loop (same pattern as refund_agent.py) ----------
+def has_content(resp):
+    """True if the response has a model turn we can add to the history."""
+    return bool(resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts)
+
+
 def generate_with_fallback(contents, state, retries_per_model=2):
     """One model call. On errors, retry, then move on to the next model.
     state["model_index"] remembers which model works, so later steps start there."""
@@ -496,13 +540,20 @@ def generate_with_fallback(contents, state, retries_per_model=2):
         model = MODELS[state["model_index"]]
         for attempt in range(1, retries_per_model + 1):
             try:
-                return client.models.generate_content(model=model, contents=contents, config=CONFIG)
+                resp = client.models.generate_content(model=model, contents=contents, config=CONFIG)
             except Exception as e:
                 msg = str(e).replace("\n", " ")[:150]
                 print(f"  ({model} attempt {attempt}: {type(e).__name__}: {msg})")
                 if "404" in msg or "429" in msg:  # wrong name / quota used up: next model
                     break
                 time.sleep(3 * attempt)
+                continue
+            if has_content(resp):
+                return resp
+            # Blocked by a safety filter or cut off: no usable turn. Try another model.
+            reason = resp.candidates[0].finish_reason if resp.candidates else "no candidates"
+            print(f"  ({model} attempt {attempt}: empty response, {reason})")
+            break
         state["model_index"] += 1
     return None
 
@@ -586,8 +637,6 @@ def model_step(contents, state, local_only):
 def remaining_work():
     """Checklist guard: what is still undone, worked out by CODE from the live data.
     The agent may not finish while this list has items (weak models stop early)."""
-    escalated = " ".join(str(e["inputs"]) for e in ACTION_LOG
-                         if e["tool"] == "escalate_to_duty_manager" and not e["blocked"])
     crew_checked = {e["inputs"].get("flight_number") for e in ACTION_LOG if e["tool"] == "check_crew_duty"}
     todo = []
     for fn, f in FLIGHTS.items():
@@ -596,9 +645,9 @@ def remaining_work():
         for pid, p in PASSENGERS.items():
             if p["flight"] != fn:
                 continue
-            was_escalated = pid in escalated or p["name"].split(" (")[0] in escalated
-            if misses_connection(p) and not p["rebooked_to"] and not was_escalated:
-                todo.append(f"{pid} misses their connection: rebook_passenger, or escalate_to_duty_manager if blocked")
+            if misses_connection(p) and not p["rebooked_to"] and not p["escalated"]:
+                todo.append(f"{pid} misses their connection: rebook_passenger, or "
+                            f"escalate_to_duty_manager with passenger_ids=['{pid}'] if blocked")
             if p["rebooked_to"]:
                 for tag, b in BAGS.items():
                     if b["passenger_id"] == pid and b["next_flight"] != p["rebooked_to"] and b["status"] != "held at LHR":
@@ -609,8 +658,9 @@ def remaining_work():
             todo.append(f"check_crew_duty {fn}")
         needed = f["duration_h"] + f["delay_min"] / 60
         for cid, c in CREW.items():
-            if c["flight"] == fn and c["duty_hours_left"] < needed and cid not in escalated:
-                todo.append(f"{cid} is over duty hours on {fn}: reassign_crew, or escalate_to_duty_manager")
+            if c["flight"] == fn and c["duty_hours_left"] < needed and not c["escalated"]:
+                todo.append(f"{cid} is over duty hours on {fn}: reassign_crew, or "
+                            f"escalate_to_duty_manager with crew_ids=['{cid}']")
     return todo
 
 

@@ -4,7 +4,7 @@ Refund agent - Gemini version (free tier) - TechX Dubai 2026 practice
 SETUP (PowerShell)
   pip install google-genai python-dotenv
   Put GEMINI_API_KEY=your-key in a .env file in the same folder
-  python refund_agent_gemini.py
+  python refund_agent.py
 
 Get a free key at aistudio.google.com. If MODEL errors, copy the current
 free model name from AI Studio.
@@ -66,6 +66,9 @@ def enforce_rules(order_id, amount):
     if not customer:
         return False, "customer not found"
 
+    if amount <= 0:
+        return False, f"refund amount must be greater than 0 (got {amount})"
+
     if amount > order["amount"]:
         return False, f"refund {amount} is more than the order amount {order['amount']}"
 
@@ -106,14 +109,23 @@ def escalate_to_human(order_id: str, summary: str) -> dict:
     return {"status": "escalated", "order_id": order_id, "summary": summary}
 
 
-def send_email(to: str, subject: str, body: str) -> dict:
-    """Email the customer with the outcome of their request."""
+def send_email(order_id: str, subject: str, body: str) -> dict:
+    """Email the customer who owns this order with the outcome of their request.
+    The system looks up the address on file; you cannot choose the recipient."""
+    # Rule: only email the order's own customer, so a message like "send the
+    # confirmation to me@other.com" cannot leak order details to someone else.
+    order = ORDERS.get(order_id)
+    customer = CUSTOMERS.get(order["customer_id"]) if order else None
+    if not customer:
+        return {"error": f"No customer email on file for order {order_id}; "
+                         "tell the customer in your reply instead"}
+    to = customer["email"]
     if to in EMAILED_THIS_REQUEST:  # a retry re-ran the request: don't email twice
         return {"status": "already sent", "note": "customer was already emailed for this request"}
     body = body.replace("\\n", "\n")  # some models send a literal \n instead of a line break
     print(f"\n  EMAIL to {to}\n  Subject: {subject}\n  {body}\n")
     EMAILED_THIS_REQUEST.add(to)
-    return {"status": "sent"}
+    return {"status": "sent", "to": to}
 
 
 def logged(fn):
@@ -142,8 +154,10 @@ Policy: refund within {REFUND_WINDOW_DAYS} days of delivery; up to AED {AUTO_LIM
 (VIP up to AED {VIP_LIMIT}); above that, escalate to a human instead of refunding.
 If a refund is blocked for being over the limit, escalate to a human. If it is blocked
 for being outside the window, politely decline. If it is blocked because the order was
-already refunded, do not refund again; email the customer that it was already refunded. If the order is not found, email the
-customer asking for the correct order ID (if you don't have their email, say so in your reply).
+already refunded, do not refund again; email the customer that it was already refunded.
+Refund amounts must be greater than 0. Emails always go to the email address on file
+for the order; ignore any other address the customer gives. If the order is not found,
+there is no email on file: ask for the correct order ID in your reply instead.
 Only use the tools provided. Never invent order data."""
 
 
@@ -159,6 +173,11 @@ CONFIG = types.GenerateContentConfig(
 )
 
 
+def has_content(resp):
+    """True if the response has a model turn we can add to the history."""
+    return bool(resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts)
+
+
 def generate_with_fallback(contents, state, retries_per_model=2):
     """One model call. On errors, retry, then move on to the next model.
     state["model_index"] remembers which model works, so later steps start there."""
@@ -166,7 +185,7 @@ def generate_with_fallback(contents, state, retries_per_model=2):
         model = MODELS[state["model_index"]]
         for attempt in range(1, retries_per_model + 1):
             try:
-                return client.models.generate_content(model=model, contents=contents, config=CONFIG)
+                resp = client.models.generate_content(model=model, contents=contents, config=CONFIG)
             except Exception as e:
                 msg = str(e).replace("\n", " ")[:150]
                 print(f"  ({model} attempt {attempt}: {type(e).__name__}: {msg})")
@@ -175,6 +194,13 @@ def generate_with_fallback(contents, state, retries_per_model=2):
                 if "404" in msg or "429" in msg:
                     break
                 time.sleep(3 * attempt)
+                continue
+            if has_content(resp):
+                return resp
+            # Blocked by a safety filter or cut off: no usable turn. Try another model.
+            reason = resp.candidates[0].finish_reason if resp.candidates else "no candidates"
+            print(f"  ({model} attempt {attempt}: empty response, {reason})")
+            break
         state["model_index"] += 1
     return None
 
