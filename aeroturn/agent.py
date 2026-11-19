@@ -15,6 +15,7 @@ RUN (from the aeroturn folder)
   python agent.py --local               # only local Ollama models (offline, free)
   python agent.py --list-providers      # which providers have a key / are reachable
   python agent.py --message "..."       # custom disruption text (checked for injection first)
+  python agent.py --flight EK-812       # which late inbound flight to recover (default: found by code)
 
 Keys go in the .env file in the agent folder (see .env.example). Never print them.
 """
@@ -86,19 +87,23 @@ Times are Dubai local. You analyse and plan. The system's CODE enforces every sa
 Operations Controller approves schedule, gate and crew changes. You cannot override a rule, sign off
 maintenance, or approve anything yourself.
 
+The message names the late INBOUND flight; the aircraft's next flight is the OUTBOUND (outbound.flight
+in the state). Use the flight IDs from the tool results, never guess them.
+
 Workflow:
-1. Call get_turnaround_and_crew_state.
+1. Call get_turnaround_and_crew_state with the late inbound flight.
 2. Passengers: for each destination, rebook missed passengers with execute_atomic_passenger_rebook onto
    flights with bookable=true. Vulnerable passengers (MEDA, UM, WCHR, INF) FIRST, in their own batch.
    Never put more passengers in a batch than the flight's free_seats. Passengers left without a seat
    stay with the transfer desk.
-3. Aircraft EK-813: call find_legal_standby_crew, then stage_controller_schedule_change:
-   - CREW_SWAP with crew_in = recommended_crew_in from the matcher.
-   - GATE_CHANGE: if gate_problem is not empty, pick a free wide-body gate, new_time = projected_departure.
-   - DELAY: new_time = projected_departure.
+3. Outbound aircraft: call find_legal_standby_crew, then stage_controller_schedule_change (only the
+   changes the state shows are needed):
+   - CREW_SWAP if any crew_on_outbound is not legal: crew_in = recommended_crew_in from the matcher.
+   - GATE_CHANGE: if gate_problem is not empty, pick a free gate that fits, new_time = projected_departure.
+   - DELAY: if the current departure is before the earliest legal departure, new_time = projected_departure.
    - DEPARTURE: propose it once, to show the controller what still blocks it.
 4. send_passenger_notification to every passenger who missed a connection (one call can list many IDs).
-5. Call get_recovery_options. The system has priced each option; compare them (cost, passengers
+5. Call get_recovery_options for the outbound flight. The system has priced each option; compare them (cost, passengers
    affected, knock-on, blockers) and recommend ONE. The controller decides, not you.
 6. If a tool returns blocked or rolled_back, read the reason, fix the request (smaller batch, another
    flight, other crew, another gate) and continue. Never try to work around a rule.
@@ -109,17 +114,20 @@ unresolved, compensation saved) | Crew & aircraft (crew swap, maintenance status
 Recommended recovery option (and why, with the system's EUR figures) | Awaiting your approval
 (approval IDs) | Blocked by guards (what and why). Use only facts from tool results."""
 
-def get_turnaround_and_crew_state() -> dict:
-    """Get the full disruption picture: the late inbound flight, the outbound flight it must
-    operate, crew legal duty left, maintenance items, gate situation, passengers who miss
-    their connection grouped by destination (vulnerable passengers first) with their
-    rebooking options, and any changes waiting for Operations Controller approval."""
-    return compact_state(T.get_turnaround_and_crew_state())
+def get_turnaround_and_crew_state(inbound_flight: str) -> dict:
+    """Get the full disruption picture for one late inbound flight (e.g. 'EK-812'): the inbound,
+    the outbound flight the same aircraft must operate next, crew legal duty left, maintenance
+    items, gate situation, passengers who miss their connection grouped by destination
+    (vulnerable passengers first) with their rebooking options, and any changes waiting for
+    Operations Controller approval."""
+    return compact_state(T.get_turnaround_and_crew_state(inbound_flight))
 
 
 def compact_state(s):
     """Short version of the state for the AI (manual: keep tool results short, every token
     counts; small local models need it). Same facts, about 3x fewer tokens."""
+    if s.get("status") == "error":
+        return s
     by_dest = {}
     for p in s["missed_connections"]["passengers"]:          # already sorted vulnerable-first
         d = by_dest.setdefault(p["destination"], {"vulnerable": [], "standard": []})
@@ -131,10 +139,10 @@ def compact_state(s):
         d["options"] = [f"{o['flight_id']} dep {o['departs']} free_seats {o['free_seats']} "
                         f"{'BOOKABLE' if o['bookable'] else 'NOT bookable: ' + o['note']}"
                         for o in s["rebooking_options"].get(dest, [])]
-    crew = lambda c: (f"{c['crew_id']} {c['name']} ({c['role']}) legal={c['legal_for_EK-813']} "
+    crew = lambda c: (f"{c['crew_id']} {c['name']} ({c['role']}) legal={c['legal_for_outbound']} "
                       f"{c['minutes_away']} min away")
     return {"now": s["now"], "inbound": s["inbound"], "outbound": s["outbound"],
-            "crew_on_EK-813": [crew(c) for c in s["crew_on_EK-813"]],
+            "crew_on_outbound": [crew(c) for c in s["crew_on_outbound"]],
             "standby_crew": [crew(c) for c in s["standby_crew"]],
             "maintenance": [f"{m['item_id']} {m['status']} mandatory={bool(m['mandatory'])}: {m['description']}"
                             for m in s["maintenance"]],
@@ -150,6 +158,7 @@ TOOLS_BY_NAME = {f.__name__: f for f in AGENT_TOOLS}
 # ---------- Run state (read by the console) ----------
 ACTION_LOG = []    # one entry per tool call
 MODELS_USED = []   # providers that answered, in order
+CURRENT = {"inbound": None}   # the disruption this run is recovering (chosen by code, not the AI)
 _on_step = None
 
 
@@ -350,9 +359,13 @@ def tool_calls_from_text(text):
     return calls
 
 
-def remaining_work():
+def remaining_work(inbound_flight=None):
     """Checklist guard (CODE): what is still undone. The agent may not finish while items remain."""
-    s = T.get_turnaround_and_crew_state()
+    inbound_flight = inbound_flight or CURRENT["inbound"]
+    s = T.get_turnaround_and_crew_state(inbound_flight)
+    if s.get("status") == "error":
+        return [s["error"]]
+    out = s["outbound"]["flight"]
     conn = db.connect(T.DB)
     todo = []
     for dest, opts in s["rebooking_options"].items():
@@ -363,28 +376,30 @@ def remaining_work():
             todo.append(f"{len(waiting)} passenger(s) to {dest} ({vul} vulnerable) still need seats and "
                         f"{seats} bookable seat(s) remain: execute_atomic_passenger_rebook")
     staged = {r[0] for r in conn.execute(
-        "SELECT kind FROM pending_approvals WHERE status IN ('PENDING','APPROVED')")}
-    if any(not c["legal_for_EK-813"] for c in s["crew_on_EK-813"]) and "CREW_SWAP" not in staged:
-        todo.append("crew on EK-813 is not legal: stage a CREW_SWAP with legal standby crew")
+        "SELECT kind, payload FROM pending_approvals WHERE status IN ('PENDING','APPROVED')")
+        if json.loads(r[1]).get("flight_id") == out}
+    if any(not c["legal_for_outbound"] for c in s["crew_on_outbound"]) and "CREW_SWAP" not in staged:
+        todo.append(f"crew on {out} is not legal: stage a CREW_SWAP with legal standby crew")
     if s["outbound"]["gate_problem"] and "GATE_CHANGE" not in staged:
-        todo.append(f"gate problem for EK-813 ({s['outbound']['gate_problem'][0]}): stage a GATE_CHANGE")
+        todo.append(f"gate problem for {out} ({s['outbound']['gate_problem'][0]}): stage a GATE_CHANGE")
     if s["outbound"]["current_departure"] < s["outbound"]["earliest_legal_departure"] and "DELAY" not in staged:
-        todo.append(f"stage a DELAY of EK-813 to {s['outbound']['earliest_legal_departure']}")
-    affected = {p["passenger_id"] for p in affected_passengers(conn)}
+        todo.append(f"stage a DELAY of {out} to {s['outbound']['earliest_legal_departure']}")
+    affected = {p["passenger_id"] for p in affected_passengers(conn, s["inbound"]["flight"])}
     notified = {r[0] for r in conn.execute("SELECT DISTINCT passenger_id FROM notifications")}
     missing = sorted(affected - notified)
     if missing:
         todo.append(f"send_passenger_notification to {len(missing)} passenger(s) not yet notified: {missing}")
     if not any(e["tool"] == "get_recovery_options" for e in ACTION_LOG):
-        todo.append("call get_recovery_options and recommend one option in the brief")
+        todo.append(f"call get_recovery_options for {out} and recommend one option in the brief")
     return todo
 
 
-def affected_passengers(conn):
-    """Everyone whose ORIGINAL connection was missed (even after rebooking)."""
-    arrival = db.to_time(conn.execute("SELECT est_arr FROM flights WHERE flight_id='EK-812'").fetchone()[0])
+def affected_passengers(conn, inbound_flight):
+    """Everyone on `inbound_flight` whose ORIGINAL connection was missed (even after rebooking)."""
+    arrival = db.to_time(conn.execute("SELECT est_arr FROM flights WHERE flight_id=?",
+                                      (inbound_flight,)).fetchone()[0])
     rows = conn.execute("SELECT p.passenger_id, f.est_dep FROM passengers p JOIN flights f "
-                        "ON f.flight_id = p.original_onward").fetchall()
+                        "ON f.flight_id = p.original_onward WHERE p.inbound_flight=?", (inbound_flight,)).fetchall()
     return [dict(r) for r in rows if g.check_connection(arrival, db.to_time(r["est_dep"]))]
 
 
@@ -452,12 +467,31 @@ def run_tool(name, arguments, provider):
     return result
 
 
-def run_agent(message, on_step=None, only=None, local_only=False):
-    """Run AeroTurn on one disruption message. Returns the final text (the executive brief)."""
+def pick_disruption(message, inbound_flight=None):
+    """CODE decides which late inbound flight this run is about: the one given, else a late
+    flight named in the message, else the only late flight. Returns (disruption, problem)."""
+    late = {d["inbound"]: d for d in T.disruptions()}
+    if inbound_flight:
+        return (late[inbound_flight], None) if inbound_flight in late else \
+            (None, f"{inbound_flight} is not a late inbound flight. Late now: {list(late) or 'none'}")
+    named = [f for f in dict.fromkeys(re.findall(r"\b[A-Z0-9]{2}-?\d{1,4}\b", message.upper()))
+             if f in late or f.replace("-", "") in {k.replace("-", "") for k in late}]
+    named = [next(k for k in late if k.replace("-", "") == f.replace("-", "")) for f in named]
+    if len(named) == 1:
+        return late[named[0]], None
+    if len(late) == 1 and not named:
+        return next(iter(late.values())), None
+    return None, (f"say which late flight to recover: {list(late)}" if late else "no late inbound flight found")
+
+
+def run_agent(message, on_step=None, only=None, local_only=False, inbound_flight=None):
+    """Run AeroTurn on one disruption message. Returns the final text (the executive brief).
+    inbound_flight: the late flight to recover; if omitted, code picks it from the message/data."""
     global _on_step
     _on_step = on_step
     ACTION_LOG.clear()
     MODELS_USED.clear()
+    CURRENT["inbound"] = None
 
     # Step 2 of the workshop diagram: check the input BEFORE it reaches any AI
     injection = screen_input(message)
@@ -470,11 +504,19 @@ def run_agent(message, on_step=None, only=None, local_only=False):
         print(f"  INPUT BLOCKED: {injection}")
         return "Input refused by the safety filter: it tries to give the agent new orders. Nothing was done."
 
+    disruption, problem = pick_disruption(message, inbound_flight)
+    if not disruption:
+        return f"Nothing was done: {problem}."
+    CURRENT["inbound"] = disruption["inbound"]
+
     chain = available_providers(only, local_only)
     if not chain:
         return "No AI provider available (no API keys found and no local model selected)."
     local = all(p["kind"] == "ollama" for p in chain)
-    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": message}]
+    # Code-verified context added AFTER screening, so the AI starts from the right flights.
+    context = (f"\n\n[System data: late inbound flight {disruption['inbound']} ({disruption['route']}, "
+               f"+{disruption['delay_min']} min); the same aircraft next operates {disruption['outbound']}.]")
+    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": message + context}]
     state = {"i": 0}
     nudges_left = MAX_REPLANS
 
@@ -565,14 +607,19 @@ if __name__ == "__main__":
     only = args[args.index("--provider") + 1] if "--provider" in args else None
     if "--db" in args:   # run on a separate database file (e.g. a long local test)
         T.DB = Path(args[args.index("--db") + 1])
-    text = args[args.index("--message") + 1] if "--message" in args else \
-        "EK-812 from Bangkok landed 75 minutes late. Recover the turnaround and the missed connections."
+    flight = args[args.index("--flight") + 1] if "--flight" in args else None
     if "--keep" not in args:
         db.build(T.DB)  # start from the clean scenario every time
+    if "--message" in args:
+        text = args[args.index("--message") + 1]
+    else:
+        d = next((x for x in T.disruptions() if x["inbound"] == flight), None) or (T.disruptions() or [None])[0]
+        text = (f"{d['inbound']} ({d['route']}) landed {d['delay_min']} minutes late. Recover the turnaround and "
+                f"the missed connections." if d else "Check for disruptions.")
     print("=" * 70)
     print(f"AeroTurn | providers: {[p['name'] for p in available_providers(only, '--local' in args)]}")
     print(f"MESSAGE: {text}\n")
-    brief = run_agent(text, only=only, local_only="--local" in args)
+    brief = run_agent(text, only=only, local_only="--local" in args, inbound_flight=flight)
     print("\n" + "=" * 70 + "\nEXECUTIVE RECOVERY BRIEF\n" + brief)
     s = summarize_log()
     print("=" * 70)
@@ -581,4 +628,4 @@ if __name__ == "__main__":
     print(f"AI used: {' -> '.join(s['models_used']) or 'none'}")
     print(f"Tool calls: blocked {len(s['blocked'])} | rolled back {len(s['rolled_back'])} | "
           f"notified {s['notifications']}")
-    print(f"Still to do (checklist): {remaining_work() or 'nothing'}")
+    print(f"Still to do (checklist): {(remaining_work() if CURRENT['inbound'] else None) or 'nothing'}")

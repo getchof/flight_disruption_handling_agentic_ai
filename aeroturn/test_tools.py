@@ -36,7 +36,8 @@ def test_state_shows_the_disruption():
     assert s["missed_connections"]["count"] == 45 and s["missed_connections"]["vulnerable"] == 10
     tiers = [p["tier"] for p in s["missed_connections"]["passengers"]]
     assert tiers[:10].count("STANDARD") == 0, "vulnerable passengers must be listed first"
-    assert all(c["duty_min_left_now"] == 20 and not c["legal_for_EK-813"] for c in s["crew_on_EK-813"])
+    assert s["outbound"]["flight"] == "EK-813", "next flight found from the aircraft registration"
+    assert all(c["duty_min_left_now"] == 20 and not c["legal_for_outbound"] for c in s["crew_on_outbound"])
     assert s["outbound"]["earliest_legal_departure"] == "11:45"
     assert s["outbound"]["gate_problem"], "B12 conflict with EK-555 should be visible"
     ek003 = [o for o in s["rebooking_options"]["LHR"] if o["flight_id"] == "EK-003"][0]
@@ -219,6 +220,65 @@ def test_notifications_use_real_facts():
     r = T.send_passenger_notification([vul[0], waiting], "Sorry! You are now on EK-999.")
     assert "rebooked on EK-005" in r["messages"][vul[0]] and "EK-999" not in r["messages"][vul[0]]
     assert "arranging your onward travel" in r["messages"][waiting]
+
+
+# ---------- Any flight, not just EK-812: a second, different disruption at the same time ----------
+def add_second_disruption(conn):
+    """EK-433 from Singapore lands 70 min late; its aircraft A6-ENX next flies EK-441 to Mumbai.
+    Unlike EK-812: the crew is legal, the gate is free, no open maintenance - only a delay is needed."""
+    t = db.t
+    conn.executemany("INSERT INTO flights VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+        ("EK-433", "SIN", "DXB", "A6-ENX", "B777-300ER", "WIDE", t("02:00"), t("03:10"), t("09:30"), t("10:40"),
+         450, "C12", "LANDED"),
+        ("EK-441", "DXB", "BOM", "A6-ENX", "B777-300ER", "WIDE", t("11:30"), t("11:30"), t("15:55"), t("15:55"),
+         185, "C12", "SCHEDULED")])
+    conn.execute("INSERT INTO gates VALUES ('C12','C',1)")
+    conn.execute("INSERT INTO gate_bookings VALUES ('C12','EK-441',?,?)", (t("10:00"), t("11:30")))
+    for i, tier in enumerate(["WCHR", "STANDARD", "STANDARD"]):   # 3 miss EK-073 to Paris (dep 11:00)
+        pid = f"Q{i + 1:03d}"
+        conn.execute("INSERT INTO passengers VALUES (?,?,?,?,?,?,?)",
+                     (pid, f"Second Pax {i}", "EK-433", "EK-073", "CDG", tier, db.NEEDS[tier]))
+        conn.execute("INSERT INTO seats VALUES ('EK-073',?,?)", (f"9{i}A", pid))
+        conn.execute("INSERT INTO bags VALUES (?,?,'EK-073','IN_TRANSFER')", (f"BAG-Q{i}", pid))
+    for i, role in enumerate(["Captain", "First Officer", "Purser", "Cabin Crew"]):
+        conn.execute("INSERT INTO crew VALUES (?,?,?,'INBOUND','EK-441','Aircraft A6-ENX',0,?)",
+                     (f"C-4{i}", f"{role} Two", role, "2026-11-20 08:00"))
+
+
+def test_any_late_flight_not_just_ek812():
+    conn = fresh()
+    add_second_disruption(conn)
+    late = {d["inbound"]: d for d in T.disruptions()}
+    assert set(late) == {"EK-812", "EK-433"} and late["EK-433"]["outbound"] == "EK-441", late
+
+    s = T.get_turnaround_and_crew_state("EK-433")
+    assert s["outbound"]["flight"] == "EK-441" and s["inbound"]["delay_min"] == 70
+    assert s["missed_connections"]["count"] == 3 and s["missed_connections"]["vulnerable"] == 1
+    assert all(c["legal_for_outbound"] for c in s["crew_on_outbound"]), "fresh crew: no swap needed"
+    assert not s["outbound"]["gate_problem"]
+    assert s["outbound"]["earliest_legal_departure"] == "12:10", "10:40 landing + 90 min turnaround"
+    assert T.get_turnaround_and_crew_state("EK-812")["missed_connections"]["count"] == 45, "disruptions kept apart"
+    assert T.get_turnaround_and_crew_state()["status"] == "error", "two disruptions: must say which one"
+
+    # Rebooking uses EK-433's own landing time; guards still apply (vulnerable first)
+    r = T.execute_atomic_passenger_rebook(missed(s, "CDG"), "EK-075")
+    assert r["status"] == "committed" and len(r["rebooked"]) == 3, r
+    assert T.integrity(conn) == {"double_bookings": 0, "orphan_bags": 0}
+    note = T.send_passenger_notification(["Q001"], "")["messages"]["Q001"]
+    assert note.startswith("EK-433 landed late") and "EK-075" in note, note
+
+    # Only the delay is needed for EK-441, and it is checked against EK-441's own turnaround
+    assert T.stage_controller_schedule_change("DELAY", "EK-441", "11:50")["status"] == "blocked"
+    assert T.stage_controller_schedule_change("DELAY", "EK-441", "12:10")["status"] == "pending_controller_approval"
+
+    import agent, costs
+    assert agent.pick_disruption("EK-433 landed late")[0]["inbound"] == "EK-433"
+    assert agent.pick_disruption("two flights are late")[0] is None, "ambiguous: code must not guess"
+    todo = agent.remaining_work("EK-433")
+    assert not any("CREW_SWAP" in x or "GATE_CHANGE" in x or "DELAY" in x for x in todo), todo
+    opts = costs.get_recovery_options("EK-441")
+    assert [o["id"] for o in opts["options"]] == ["A", "C"], "no 'wait for crew rest' option when crew is legal"
+    assert "crew swap" not in opts["options"][0]["title"].lower()
 
 
 if __name__ == "__main__":
