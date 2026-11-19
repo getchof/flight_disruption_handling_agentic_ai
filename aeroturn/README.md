@@ -25,6 +25,7 @@ python -m streamlit run app.py                       # console at http://localho
 | `python agent.py --local` | Same, offline on Ollama qwen3:4b | Local only |
 | `python agent.py --delay 150 --crew-left 600` | What-if: a different delay / crew situation | Yes |
 | `python test_whatif.py` | 10 tests: rules, costs and rollback adapt to other scenarios | No |
+| `python agent.py --flight EK-812` | Recover a specific late inbound flight (default: code finds the late one) | Yes |
 | `python agent.py --list-providers` | Which keys are set (never prints them) | No |
 
 ## 90-second demo script

@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 DB_PATH = Path(__file__).with_name("aircraft_turnaround_disruption.sqlite")
+HUB = "DXB"  # the airport whose turnarounds AeroTurn manages
 NOW = datetime(2026, 11, 20, 10, 15)  # scenario clock: EK-812 has just landed
 TIME_FMT = "%Y-%m-%d %H:%M"
 SEED = 812
