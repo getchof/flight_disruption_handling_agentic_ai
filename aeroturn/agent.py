@@ -103,6 +103,7 @@ Workflow:
    - DELAY: if the current departure is before the earliest legal departure, new_time = projected_departure.
    - DEPARTURE: propose it once, to show the controller what still blocks it.
 4. send_passenger_notification to every passenger who missed a connection (one call can list many IDs).
+   The system writes each passenger's facts; your note is only an apology, with no facts or promises.
 5. Call get_recovery_options for the outbound flight. The system has priced each option; compare them (cost, passengers
    affected, knock-on, blockers) and recommend ONE. The controller decides, not you.
 6. If a tool returns blocked or rolled_back, read the reason, fix the request (smaller batch, another

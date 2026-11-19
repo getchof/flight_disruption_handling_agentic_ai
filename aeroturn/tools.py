@@ -19,6 +19,7 @@ Every write goes through BEGIN / COMMIT / ROLLBACK and is written to audit_log.
   python test_tools.py   # proves rollback, guards and the approval gate (no AI)
 """
 import json
+import re
 from datetime import datetime, timedelta
 
 import db
@@ -29,6 +30,9 @@ DB = db.DB_PATH   # tests point this at a temporary copy
 
 # Demo switch: make a "concurrent booking" steal a seat mid-batch, to show the rollback.
 SIMULATE_SEAT_CONFLICT = {"enabled": False, "at_item": 3}
+# Demo switch: the baggage system silently fails to transfer one passenger's bags mid-batch.
+# Nothing raises an error: the integrity check before COMMIT must catch the orphaned bags.
+SIMULATE_BAG_CONFLICT = {"enabled": False, "at_item": 3}
 
 
 class Conflict(Exception):
@@ -404,7 +408,10 @@ def execute_atomic_passenger_rebook(passenger_ids: list[str], new_flight: str) -
                                (pid, new_flight, seat["seat_no"])).rowcount                  # claim new seat
             if taken != 1:
                 raise Conflict(f"item {i} ({pid}): seat {new_flight}/{seat['seat_no']} was taken by another booking")
-            tx.execute("UPDATE bags SET routed_to=?, status='IN_TRANSFER' WHERE passenger_id=?", (new_flight, pid))
+            if SIMULATE_BAG_CONFLICT["enabled"] and i == SIMULATE_BAG_CONFLICT["at_item"]:
+                SIMULATE_BAG_CONFLICT["enabled"] = False    # one-shot: the bag transfer is "lost", no error
+            else:
+                tx.execute("UPDATE bags SET routed_to=?, status='IN_TRANSFER' WHERE passenger_id=?", (new_flight, pid))
             done.append({"passenger_id": pid, "seat": seat["seat_no"]})
             progress["done"] = len(done)
         return {"status": "committed", "new_flight": new_flight, "departs": flight["est_dep"][-5:],
@@ -541,11 +548,35 @@ def stage_controller_schedule_change(kind: str, flight_id: str, new_time: str = 
 # =====================================================================
 # AGENT TOOL 4: passenger notification (facts written by code)
 # =====================================================================
+# The AI's note is the SAME text for every passenger in the call, so it may not state facts:
+# a note like "your new flight is confirmed" would also reach passengers who have no flight.
+NOTE_FACT_WORDS = re.compile(r"EK-|\d|\b(flight|rebook\w*|confirm\w*|seat\w*|gate|depart\w*|board\w*|arriv\w*|"
+                             r"bag\w*|luggage|hotel|meal|voucher|compensat\w*|refund\w*|time|schedul\w*)\b", re.I)
+NOTE_MAX_CHARS = 200
+
+
+def _safe_note(note):
+    """CODE guard on the AI's note: keep it only if it is a short message with no factual claim."""
+    note = (note or "").strip()
+    if not note:
+        return "", None
+    if len(note) > NOTE_MAX_CHARS:
+        return "", f"note dropped: longer than {NOTE_MAX_CHARS} characters"
+    hit = NOTE_FACT_WORDS.search(note)
+    if hit:
+        return "", (f"note dropped: it contains '{hit.group(0)}'. The system writes all facts; "
+                    f"the note may only be an apology or reassurance")
+    return note, None
+
+
 def send_passenger_notification(passenger_ids: list[str], note: str) -> dict:
     """Notify passengers. The system writes each passenger's real situation (new flight, seat,
-    departure, or that staff are arranging their travel). `note` is only a short friendly
-    message from you (e.g. an apology); do not put flight details in it."""
+    departure, or that staff are arranging their travel). `note` is only a short apology or
+    reassurance from you, the same for everyone in the call, e.g. 'We are very sorry for the
+    disruption.' Any note that mentions flights, times, seats, bags, confirmations or compensation
+    is dropped by the system."""
     conn = _conn()
+    note, note_problem = _safe_note(note)
     sent = {}
     for pid in passenger_ids:
         p = conn.execute("SELECT * FROM passengers WHERE passenger_id=?", (pid,)).fetchone()
@@ -566,12 +597,16 @@ def send_passenger_notification(passenger_ids: list[str], note: str) -> dict:
             facts = f"{inbound} landed late, but your connection {p['original_onward']} is still on time."
         if p["tier"] != "STANDARD":
             facts += f" Assistance ({p['needs']}) will meet you at the aircraft door."
-        sent[pid] = facts + (f" {note.strip()}" if note and not any(f in note for f in ("EK-", "seat ")) else "")
+        sent[pid] = facts + (f" {note}" if note else "")
 
     def apply(tx, progress):
         tx.executemany("INSERT INTO notifications (ts, passenger_id, text) VALUES (?,?,?)",
                        [(_ts(), pid, text) for pid, text in sent.items()])
-        return {"status": "sent", "count": len(sent), "messages": sent, "summary": f"{len(sent)} sent"}
+        result = {"status": "sent", "count": len(sent), "messages": sent, "summary": f"{len(sent)} sent"}
+        if note_problem:
+            result["note_warning"] = note_problem
+            result["summary"] += f" ({note_problem})"
+        return result
 
     return write_gateway("notifications_sent", "CODE", {"passenger_ids": passenger_ids}, apply)
 

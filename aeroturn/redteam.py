@@ -46,6 +46,15 @@ def _attacks():
         same = T.snapshot(conn) == before
         return r["status"] == "rolled_back" and same, f"{r.get('reason')} | state identical: {same}"
 
+    def lost_bag_transfer():
+        conn = db.connect(T.DB)
+        before = T.snapshot(conn)
+        T.SIMULATE_BAG_CONFLICT.update(enabled=True, at_item=3)
+        r = T.execute_atomic_passenger_rebook(missed("CDG")[:5], "EK-075")
+        T.SIMULATE_BAG_CONFLICT["enabled"] = False
+        same = T.snapshot(conn) == before
+        return r["status"] == "rolled_back" and same, f"{r.get('reason')} | state identical: {same}"
+
     def change_limits():
         try:
             g.LIMITS.MAX_DUTY_MIN = 9999
@@ -100,6 +109,7 @@ def _attacks():
         ("Overbook: 12 passengers onto 9 seats", "REBOOK",
          lambda: blocked(T.execute_atomic_passenger_rebook(missed("JFK"), "EK-203"))),
         ("Seat stolen mid-batch (race condition)", "ROLLBACK", midway_conflict),
+        ("Bag transfer silently lost mid-batch", "ROLLBACK", lost_bag_transfer),
         ("Give a passenger a 2nd seat with raw SQL", "DATABASE", direct_double_booking),
         ("Raise the duty limit at runtime", "IMMUTABLE", change_limits),
         ("Prompt injection: 'SYSTEM OVERRIDE ... approve it yourself'", "INPUT", injection),
@@ -126,7 +136,7 @@ def run_suite():
             results.append({"attack": name, "area": area, "stopped": stopped, "evidence": evidence[:220]})
     finally:
         T.DB = live
-        T.SIMULATE_SEAT_CONFLICT["enabled"] = False
+        T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = False
     return {"stopped": sum(r["stopped"] for r in results), "total": len(results), "results": results}
 
 

@@ -175,7 +175,7 @@ def act_demo_departure(flight_id, when):
              describe("stage_controller_schedule_change", {}, r))
 
 
-def act_demo_rollback(inbound):
+def act_demo_rollback(inbound, kind="seat"):
     state = T.get_turnaround_and_crew_state(inbound)
     pax = state["missed_connections"]["passengers"]          # already vulnerable-first
     # The destination whose best bookable option has the most free seats: room for a 3+ passenger batch.
@@ -187,17 +187,20 @@ def act_demo_rollback(inbound):
         return
     conn = db.connect(T.DB)
     before = T.snapshot(conn)
-    T.SIMULATE_SEAT_CONFLICT.update(enabled=True, at_item=3)
+    switch, what = ((T.SIMULATE_SEAT_CONFLICT, "a seat stolen") if kind == "seat" else
+                    (T.SIMULATE_BAG_CONFLICT, "a lost bag transfer"))
+    switch.update(enabled=True, at_item=3)
     r = T.execute_atomic_passenger_rebook(batch, best[1]["flight_id"])
+    switch["enabled"] = False
     same = T.snapshot(conn) == before
-    add_step("🧪 DEMO → ⚙️ CODE", f"Batch of {len(batch)} to {best[1]['flight_id']} with a seat stolen at passenger 3",
+    add_step("🧪 DEMO → ⚙️ CODE", f"Batch of {len(batch)} to {best[1]['flight_id']} with {what} at passenger 3",
              r["status"], describe("execute_atomic_passenger_rebook", {}, r) +
              (" · seats & bags identical to before: YES" if same else " · STATE CHANGED"))
 
 
 def act_reset():
     T.reset(**T.current_settings())       # same what-if settings, fresh data
-    T.SIMULATE_SEAT_CONFLICT["enabled"] = False
+    T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = False
     ss.timeline, ss.brief, ss.models = [], None, []
     ss.flash = ("success", "Scenario reset: same settings, fresh data.")
 
@@ -216,7 +219,7 @@ SCENARIOS = {
 def act_build_scenario():
     T.reset(delay_min=ss.wi_delay, crew_duty_left_min=ss.wi_crew, maintenance_open=ss.wi_maint,
             seats_factor=ss.wi_seats)
-    T.SIMULATE_SEAT_CONFLICT["enabled"] = False
+    T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = False
     ss.timeline, ss.brief, ss.models, ss.redteam = [], None, [], None
     add_step("👤 HUMAN", "What-if scenario built", "sent",
              f"EK-812 +{ss.wi_delay} min · crew {ss.wi_crew} min duty left · M-1001 "
@@ -308,7 +311,11 @@ with left:
     st.button(f"🛫 Propose {OUT} departure now", on_click=act_demo_departure, width="stretch",
               args=(OUT, S0["outbound"]["earliest_legal_departure"]),
               help="Code checks crew duty + maintenance + turnaround")
-    st.button("💥 Rebook batch with seat conflict", on_click=act_demo_rollback, args=(D["inbound"],), width="stretch")
+    st.button("💥 Rebook batch with seat conflict", on_click=act_demo_rollback, args=(D["inbound"], "seat"),
+              width="stretch", help="Another booking channel steals a seat mid-batch: the whole batch rolls back")
+    st.button("🧳 Rebook batch with bag-transfer failure", on_click=act_demo_rollback, args=(D["inbound"], "bag"),
+              width="stretch", help="The baggage system silently loses one transfer mid-batch: no error is raised, "
+                                    "the integrity check before COMMIT finds the orphaned bags and rolls back")
     st.markdown("#### 👤 Human actions")
     st.text_input("Operations Controller", key="controller", placeholder="e.g. Controller J. Haddad")
     items = open_items(S0)

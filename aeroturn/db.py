@@ -339,10 +339,15 @@ def double_bookings(conn):
 
 
 def orphan_bags(conn):
-    """Bags routed to a flight their passenger has no seat on. Must always be empty."""
+    """Bags separated from their passenger. Must always be empty. Either:
+      - routed to a flight their passenger has no seat on, or
+      - HELD at the hub although their passenger was already rebooked (left behind)."""
     return [r["bag_tag"] for r in conn.execute(
         "SELECT b.bag_tag FROM bags b WHERE b.status <> 'HELD' AND NOT EXISTS ("
-        "  SELECT 1 FROM seats s WHERE s.occupant = b.passenger_id AND s.flight_id = b.routed_to)")]
+        "  SELECT 1 FROM seats s WHERE s.occupant = b.passenger_id AND s.flight_id = b.routed_to) "
+        "UNION SELECT b.bag_tag FROM bags b JOIN passengers p ON p.passenger_id = b.passenger_id "
+        "  JOIN seats s ON s.occupant = p.passenger_id "
+        "WHERE b.status = 'HELD' AND s.flight_id <> p.original_onward")]
 
 
 def missed_connections(conn):

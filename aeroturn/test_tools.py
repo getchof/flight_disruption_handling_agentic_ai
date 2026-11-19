@@ -15,7 +15,7 @@ def fresh():
     """Point the tools at a brand-new database and return a connection to it."""
     T.DB = Path(tempfile.mkdtemp()) / "aeroturn_test.sqlite"
     db.build(T.DB)
-    T.SIMULATE_SEAT_CONFLICT["enabled"] = False
+    T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = False
     return db.connect(T.DB)
 
 
@@ -250,6 +250,40 @@ def test_notifications_use_real_facts():
     r = T.send_passenger_notification([vul[0], waiting], "Sorry! You are now on EK-999.")
     assert "rebooked on EK-005" in r["messages"][vul[0]] and "EK-999" not in r["messages"][vul[0]]
     assert "arranging your onward travel" in r["messages"][waiting]
+
+
+def test_ai_note_cannot_state_facts():
+    """Found in a live run: the AI's note 'Your new flight details are confirmed.' went to every
+    passenger in the call, including those with no new flight. Notes may not state facts."""
+    fresh()
+    s = T.get_turnaround_and_crew_state()
+    vul = missed(s, "LHR", vulnerable=True)
+    T.execute_atomic_passenger_rebook(vul, "EK-005")
+    waiting = missed(s, "JFK")[0]
+    live_note = "We apologise for the disruption. Your new flight details are confirmed."
+    r = T.send_passenger_notification([vul[0], waiting], live_note)
+    assert "confirmed" not in r["messages"][waiting] and "flight" in r["note_warning"], r
+    for bad in ("A hotel voucher is waiting for you.", "Boarding starts soon.", "See you at 14:30!", "x" * 250):
+        assert "note_warning" in T.send_passenger_notification([waiting], bad), bad
+    ok = T.send_passenger_notification([waiting], "We are very sorry for the disruption.")
+    assert ok["messages"][waiting].endswith("We are very sorry for the disruption.") and "note_warning" not in ok
+
+
+def test_midway_bag_transfer_failure_rolls_back_everything():
+    """The baggage step silently fails (no exception): the integrity check must catch it."""
+    for held in (False, True):              # bags in transit, and bags already held at the hub
+        conn = fresh()
+        if held:
+            T.hold_missed_bags()
+        batch = missed(T.get_turnaround_and_crew_state(), "CDG")[:6]
+        before = T.snapshot(conn)
+        T.SIMULATE_BAG_CONFLICT.update(enabled=True, at_item=3)
+        r = T.execute_atomic_passenger_rebook(batch, "EK-075")
+        T.SIMULATE_BAG_CONFLICT["enabled"] = False
+        assert r["status"] == "rolled_back" and "orphan_bags" in r["reason"], (held, r)
+        assert T.snapshot(conn) == before, "rollback must leave seats and bags exactly as they were"
+        assert T.integrity(conn) == {"double_bookings": 0, "orphan_bags": 0}
+        assert T.execute_atomic_passenger_rebook(batch, "EK-075")["status"] == "committed"
 
 
 # ---------- Bags of passengers who missed their connection ----------
