@@ -317,7 +317,12 @@ def test_realistic_extra_recovery_options():
     assert "105 passengers today, 205 tomorrow" in e["title"] and e["total_eur"] < opts["C"]["total_eur"]
     # F: next legal crew (Capt. Grace Lee from the hotel), later than A, never the 'lowest cost' over A
     assert "Capt. Grace Lee" in f["title"] and f["delay_min"] > opts["A"]["delay_min"]
-    assert costs.get_recovery_options("EK-813")["lowest_cost_feasible"] == "A"
+    r = costs.get_recovery_options("EK-813")
+    # A and F both cost EUR 1,500: the tie is broken by the earlier departure (A 11:45 vs F 12:00), not list order
+    assert r["lowest_cost_feasible"] == "A" and r["lowest_cost_tied_with"] == ["F"], r["lowest_cost_tied_with"]
+    reordered = sorted(r["options"], key=lambda o: o["id"] != "F")       # F first: A must still win
+    best = min((o for o in reordered if o["feasible"]), key=lambda o: (o["total_eur"], o["delay_min"]))
+    assert best["id"] == "A"
 
 
 def test_choosing_the_same_option_twice_records_it_once():

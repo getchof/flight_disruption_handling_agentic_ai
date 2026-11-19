@@ -272,7 +272,7 @@ def act_demo_rollback(inbound, kind="seat"):
 def act_reset():
     T.reset(**T.current_settings())       # same what-if settings, fresh data
     T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = False
-    ss.timeline, ss.brief, ss.models = [], None, []
+    ss.timeline, ss.brief, ss.models, ss.show_options_for = [], None, [], None
     ss.flash = ("success", "Scenario reset: same settings, fresh data.")
 
 
@@ -291,7 +291,7 @@ def act_build_scenario():
     T.reset(delay_min=ss.wi_delay, crew_duty_left_min=ss.wi_crew, maintenance_open=ss.wi_maint,
             seats_factor=ss.wi_seats)
     T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = False
-    ss.timeline, ss.brief, ss.models, ss.redteam = [], None, [], None
+    ss.timeline, ss.brief, ss.models, ss.redteam, ss.show_options_for = [], None, [], None, None
     add_step("👤 HUMAN", "What-if scenario built", "sent",
              f"EK-812 +{ss.wi_delay} min · crew {ss.wi_crew} min duty left · M-1001 "
              f"{'OPEN' if ss.wi_maint else 'signed off'} · free seats x{ss.wi_seats}")
@@ -570,7 +570,30 @@ tab_opt, tab_cp, tab_rt, tab_audit, tab_pax = st.tabs(
     ["💶 Recovery options & EU261", "🛫 Turnaround critical path", "🛡️ Red-team scorecard",
      "🔗 Tamper-evident audit", "🧳 Passengers"])
 
-with tab_opt:
+def options_revealed():
+    """Show the priced options once they belong in the story: after the AI has asked code to price them
+    in a run (audit log, so it survives a reload and Reset clears it), once the controller has chosen,
+    or when the controller asks for them without AI (offline backup, what-if)."""
+    if ss.get("show_options_for") == OUT:
+        return True
+    conn = db.connect(T.DB)
+    if T.chosen_plan(conn, OUT):
+        return True
+    for (detail,) in conn.execute("SELECT detail FROM audit_log WHERE actor='AI' "
+                                  "AND action='requested:get_recovery_options'"):
+        try:
+            if json.loads(detail).get("flight_id") == OUT:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def act_show_options():
+    ss.show_options_for = OUT
+
+
+def draw_recovery_options():
     r = costs.get_recovery_options(OUT)
     p = r["connecting_passengers"]
     st.markdown(f"<span class='chip c-blue'>⚙️ CODE prices</span><span class='chip c-blue'>🤖 AI recommends "
@@ -578,20 +601,25 @@ with tab_opt:
                 f"<span class='muted'>{esc(r['basis'])}</span>", unsafe_allow_html=True)
     per_row = 3                                   # up to six options: two rows of three readable cards
     cols = [c for i in range(0, len(r["options"]), per_row) for c in st.columns(per_row)]
+    cheapest_eur = next(o["total_eur"] for o in r["options"] if o["id"] == r["lowest_cost_feasible"])
+    tied = r.get("lowest_cost_tied_with", [])
     for col, o in zip(cols, r["options"]):
         best = o["id"] == r["lowest_cost_feasible"]
+        same_cost = o["total_eur"] == cheapest_eur                       # green money for every option at the minimum
+        best_label = (" · lowest cost, earliest departure" if tied else " · lowest cost") if best else \
+                     (f" · same cost as {r['lowest_cost_feasible']}, departs later" if o["id"] in tied else "")
         chosen = r["selected_by_controller"] == o["id"]
         executing = o["id"] == "A" and bool(r["option_a_in_execution"])
         locked = o["id"] != "A" and bool(r["option_a_in_execution"])     # A already under way: B/C would contradict
         with col:
             st.markdown(flat(f"""<div class="card" style="border-color:{'#2ecc71' if best else '#24406b'}">
-              <span class="chip {'c-green' if best else 'c-grey'}">Option {o['id']}{' · lowest cost' if best else ''}</span>
+              <span class="chip {'c-green' if best else 'c-grey'}">Option {o['id']}{best_label}</span>
               {'<span class="chip c-purple">CHOSEN</span>' if chosen else ''}
               {'<span class="chip c-amber">IN EXECUTION: ' + esc(', '.join(r['option_a_in_execution'])) + ' approved</span>' if executing else ''}
               {'<span class="chip c-red">LOCKED: option A already under way</span>' if locked else ''}
               <div class="h" style="margin:6px 0"><b>{esc(o['title'])}</b></div>
               <div class="kpi" style="margin:6px 0"><div class="l">Total cost (EUR)</div>
-                <div class="v {'ok' if best else 'bad'}">{o['total_eur']:,}</div></div>
+                <div class="v {'ok' if same_cost else 'bad'}">{o['total_eur']:,}</div></div>
               <div class="muted">Compensation €{o['compensation_eur']:,} · care €{o['care_eur']:,} ·
                 operations €{o['operational_eur']:,}<br>{esc(OUT)} delay {o['delay_min']} min<br>
                 Knock-on: {esc(o['knock_on'])}<br>Still needs: {esc(', '.join(o['blockers']) or 'nothing')}</div>
@@ -605,6 +633,19 @@ with tab_opt:
     st.markdown(f"**Connecting passengers:** {p['affected']} affected · {p['rebooked_same_day']} rebooked today · "
                 f"{p['unresolved_overnight']} overnight · compensation + care now **€{p['cost_now_eur']:,}** vs "
                 f"€{p['cost_if_nobody_rebooked_eur']:,} if nobody were rebooked → **saved €{p['saved_by_rebooking_eur']:,}**")
+
+
+with tab_opt:
+    if options_revealed():
+        draw_recovery_options()
+    else:
+        st.markdown(f"<span class='chip c-blue'>⚙️ CODE prices</span><span class='chip c-blue'>🤖 AI recommends</span>"
+                    f"<span class='chip c-purple'>👤 Controller chooses</span>", unsafe_allow_html=True)
+        st.markdown(f"<p class='muted'>The recovery options for {esc(OUT)} appear when the AI analyses the "
+                    f"disruption: it asks the code to price every option, then recommends one in its brief, and "
+                    f"you choose. Press <b>▶ Run AeroTurn agent</b>.</p>", unsafe_allow_html=True)
+        st.button("Show options now (no AI)", on_click=act_show_options,
+                  help="Backup without AI (offline, or to explore a what-if scenario): the prices come from code either way")
 
 with tab_cp:
     plan = T.turnaround_plan_for(OUT)

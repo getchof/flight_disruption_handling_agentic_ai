@@ -299,9 +299,13 @@ def get_recovery_options(flight_id: str) -> dict:
 
     for o in options:
         o["total_eur"] = o["compensation_eur"] + o["care_eur"] + o["operational_eur"] + o.get("knock_on_eur", 0)
-    cheapest = min((o for o in options if o["feasible"]), key=lambda o: o["total_eur"])
+    feasible = [o for o in options if o["feasible"]]
+    # Best = lowest total cost; on a tie, the earliest departure wins (same money, passengers arrive sooner)
+    cheapest = min(feasible, key=lambda o: (o["total_eur"], o["delay_min"]))
+    tied = [o["id"] for o in feasible if o["total_eur"] == cheapest["total_eur"] and o is not cheapest]
     return {"flight": flight_id, "currency": "EUR", "basis": "EU261-style bands, indicative", "options": options,
-            "lowest_cost_feasible": cheapest["id"], "selected_by_controller": T.chosen_plan(conn, flight_id),
+            "lowest_cost_feasible": cheapest["id"], "lowest_cost_tied_with": tied,
+            "selected_by_controller": T.chosen_plan(conn, flight_id),
             "option_a_in_execution": T.approved_changes(conn, flight_id),
             "connecting_passengers": passenger_recovery(inbound["flight_id"])}
 
