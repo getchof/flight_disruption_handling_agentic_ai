@@ -13,6 +13,7 @@ If the UI ever fails, everything still runs in the terminal:  python agent.py
 """
 import html
 import json
+import threading
 from datetime import datetime
 
 import streamlit as st
@@ -56,6 +57,14 @@ ss.setdefault("timeline", [])     # every step shown in the centre column
 ss.setdefault("brief", None)
 ss.setdefault("models", [])
 ss.setdefault("flash", None)      # one-off message after a button
+ss.setdefault("run", None)        # the agent run in the background thread (see start_agent_run)
+
+AGENT_THREAD = "aeroturn-agent"
+
+
+def agent_busy():
+    """True while an agent run is working (any browser session: the agent's run state is shared)."""
+    return any(t.name == AGENT_THREAD and t.is_alive() for t in threading.enumerate())
 
 
 def esc(x):
@@ -125,16 +134,78 @@ TOOL_TITLES = {"get_turnaround_and_crew_state": "Read turnaround & crew state",
                "input_filter": "Input safety filter"}
 
 
-def on_agent_step(e):
-    """Called by the agent after every tool call -> live timeline."""
+def step_from_agent_event(e):
+    """Turn one agent tool call into a timeline entry (plain data: runs in the agent thread)."""
     if e["tool"] == "input_filter":
-        add_step("⚙️ CODE", "Input safety filter", "blocked", " · ".join(e["result"]["violations"]))
-    else:
-        kind = e["inputs"].get("kind", "")
-        add_step(f"🤖 AI ({e['provider']}) → ⚙️ CODE", f"{TOOL_TITLES.get(e['tool'], e['tool'])} {kind}".strip(),
-                 e["status"], describe(e["tool"], e["inputs"], e["result"]))
-    draw_timeline()
-    draw_status()
+        return {"time": now(), "actor": "⚙️ CODE", "title": "Input safety filter", "status": "blocked",
+                "detail": " · ".join(e["result"]["violations"])}
+    kind = e["inputs"].get("kind", "")
+    try:
+        detail = describe(e["tool"], e["inputs"], e["result"])
+    except Exception:                       # never let a display problem stop the agent
+        detail = json.dumps(e["result"])[:200]
+    return {"time": now(), "actor": f"🤖 AI ({e['provider']}) → ⚙️ CODE",
+            "title": f"{TOOL_TITLES.get(e['tool'], e['tool'])} {kind}".strip(), "status": e["status"], "detail": detail}
+
+
+# ---------- The agent runs in a background thread ----------
+# A Streamlit page reruns from the top on every click. If the agent ran inside the page, the controller
+# typing a name or pressing Approve would stop it mid-way. In its own thread it keeps going: the page
+# collects its steps every 2 seconds, and the controller can approve while the AI works.
+def start_agent_run(message, only, local_only, inbound, conflict):
+    job = {"events": [], "seen": 0, "done": False, "collected": False, "brief": None, "models": [], "error": None}
+
+    def work():
+        try:
+            job["brief"] = agent.run_agent(message, on_step=lambda e: job["events"].append(step_from_agent_event(e)),
+                                           only=only, local_only=local_only, inbound_flight=inbound)
+        except Exception as ex:
+            job["error"] = f"{type(ex).__name__}: {ex}"
+        finally:
+            job["models"] = list(agent.MODELS_USED)
+            T.SIMULATE_SEAT_CONFLICT["enabled"] = False
+            job["done"] = True
+
+    T.SIMULATE_SEAT_CONFLICT.update(enabled=conflict, at_item=3)
+    ss.run = job
+    threading.Thread(target=work, name=AGENT_THREAD, daemon=True).start()
+
+
+def collect_agent_run():
+    """Move new agent steps into the timeline; when the run has finished, show its brief."""
+    job = ss.run
+    if not job:
+        return
+    new = job["events"][job["seen"]:]
+    ss.timeline.extend(new)
+    job["seen"] += len(new)
+    if job["done"] and not job["collected"]:
+        job["collected"] = True
+        ss.brief = job["brief"] or f"⚠️ The agent stopped with an error: {job['error']}"
+        ss.models = job["models"]
+
+
+def agent_run_status():
+    """Small live panel (re-runs itself every 2 s while the agent works): refreshes the page on news."""
+    job = ss.run
+    if not job:
+        return
+    if len(job["events"]) > job["seen"] or (job["done"] and not job["collected"]):
+        st.rerun(scope="app")
+    if not job["done"]:
+        if agent.STOP.is_set():
+            st.warning("■ Stopping after the current AI step… (a slow local model can take a few minutes)")
+        else:
+            st.info(f"🤖 Agent running… {len(job['events'])} step(s) so far. You can approve, reject and sign off "
+                    f"while it works; the brief appears when it finishes.")
+            st.button("■ Stop agent", on_click=agent.STOP.set, width="stretch",
+                      help="Ends the run after the current AI step. Everything already done stays done; "
+                           "what is left goes to human review.")
+
+
+collect_agent_run()
+BUSY = agent_busy()
+BUSY_HELP = "Disabled while the agent is running (it would change the data under the agent)"
 
 
 # ---------- Human / demo actions (buttons) ----------
@@ -281,7 +352,8 @@ with left:
                   help="EK-813 needs 465 min flight + 30 min post-flight = 495 min after departure.")
         st.toggle("Hydraulic inspection M-1001 still open", key="wi_maint")
         st.slider("Free seats on rebooking flights (x)", 0.0, 2.0, step=0.25, key="wi_seats")
-        st.button("🔁 Build this scenario", on_click=act_build_scenario, width="stretch", type="secondary")
+        st.button("🔁 Build this scenario", on_click=act_build_scenario, width="stretch", type="secondary",
+                  disabled=BUSY, help=BUSY_HELP if BUSY else None)
         st.caption("Rebuilds the database. Rules, critical path, costs and the AI all adapt; nothing is hard-coded.")
 
     st.markdown("#### 🛠️ Control")
@@ -305,23 +377,29 @@ with left:
                            key=f"msg_{preset}_{D['inbound']}_{D['delay_min']}")
     conflict = st.toggle("💥 Simulate mid-way seat conflict", help="A seat is stolen during the next rebooking batch "
                          "(one time). The whole batch must roll back.")
-    run = st.button("▶ Run AeroTurn agent", type="primary", width="stretch")
+    run = st.button("▶ Run AeroTurn agent", type="primary", width="stretch", disabled=BUSY,
+                    help="The agent is already running" if BUSY else None)
+    if BUSY or (ss.run and not ss.run["collected"]):
+        st.fragment(agent_run_status, run_every=2)()
 
     st.markdown("#### 🧪 Guard demos (no AI)")
     st.button(f"🛫 Propose {OUT} departure now", on_click=act_demo_departure, width="stretch",
               args=(OUT, S0["outbound"]["earliest_legal_departure"]),
               help="Code checks crew duty + maintenance + turnaround")
     st.button("💥 Rebook batch with seat conflict", on_click=act_demo_rollback, args=(D["inbound"], "seat"),
-              width="stretch", help="Another booking channel steals a seat mid-batch: the whole batch rolls back")
+              width="stretch", disabled=BUSY,
+              help=BUSY_HELP if BUSY else "Another booking channel steals a seat mid-batch: the whole batch rolls back")
     st.button("🧳 Rebook batch with bag-transfer failure", on_click=act_demo_rollback, args=(D["inbound"], "bag"),
-              width="stretch", help="The baggage system silently loses one transfer mid-batch: no error is raised, "
-                                    "the integrity check before COMMIT finds the orphaned bags and rolls back")
+              width="stretch", disabled=BUSY,
+              help=BUSY_HELP if BUSY else "The baggage system silently loses one transfer mid-batch: no error is "
+                                          "raised, the integrity check before COMMIT finds the orphaned bags and rolls back")
     st.markdown("#### 👤 Human actions")
     st.text_input("Operations Controller", key="controller", placeholder="e.g. Controller J. Haddad")
     items = open_items(S0)
     st.button(f"🔧 Engineer signs off {', '.join(items) or 'maintenance'}", on_click=act_signoff, args=(items,),
               disabled=not items, width="stretch")
-    st.button("↺ Reset scenario", on_click=act_reset, width="stretch")
+    st.button("↺ Reset scenario", on_click=act_reset, width="stretch", disabled=BUSY,
+              help=BUSY_HELP if BUSY else None)
 
 # ---------- Centre: timeline + brief ----------
 with center:
@@ -445,18 +523,12 @@ def draw_brief():
 
 
 # ---------- Run the agent (live) ----------
-if run:
-    T.SIMULATE_SEAT_CONFLICT.update(enabled=conflict, at_item=3)
+if run and not agent_busy():
     only = None if choice.startswith("Auto") or choice.startswith("Local") else choice
     add_step("👤 HUMAN", "Alert submitted to AeroTurn", "sent", message)
-    draw_timeline()
-    draw_status()
-    with st.spinner("AeroTurn is working… (local models can take several minutes)"):
-        ss.brief = agent.run_agent(message, on_step=on_agent_step, only=only, local_only=choice.startswith("Local"),
-                                   inbound_flight=D["inbound"])
-    ss.models = list(agent.MODELS_USED)
-    T.SIMULATE_SEAT_CONFLICT["enabled"] = False
-    st.rerun()   # redraw everything (approval buttons, brief) from the final state
+    ss.brief, ss.models = None, []
+    start_agent_run(message, only, choice.startswith("Local"), D["inbound"], conflict)
+    st.rerun()   # redraw with the Run button disabled and the live status panel
 
 draw_timeline()
 draw_status()
@@ -563,7 +635,9 @@ with tab_cp:
                 f"human. Calculated by code with the Critical Path Method, not by the AI.</p>", unsafe_allow_html=True)
 
 with tab_rt:
-    st.button("🛡️ Run red-team attack suite (on a fresh copy of the scenario)", on_click=act_redteam, type="primary")
+    st.button("🛡️ Run red-team attack suite (on a fresh copy of the scenario)", on_click=act_redteam, type="primary",
+              disabled=BUSY, help="Disabled while the agent is running (the suite switches to a scratch database)"
+              if BUSY else None)
     card = ss.get("redteam")
     if card:
         good = card["stopped"] == card["total"]

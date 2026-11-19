@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -161,6 +162,7 @@ ACTION_LOG = []    # one entry per tool call
 MODELS_USED = []   # providers that answered, in order
 CURRENT = {"inbound": None}   # the disruption this run is recovering (chosen by code, not the AI)
 _on_step = None
+STOP = threading.Event()   # set by the controller (console "Stop agent"): the run ends after the current step
 
 
 # =====================================================================
@@ -324,6 +326,8 @@ def call_with_fallback(messages, chain, state):
     while state["i"] < len(chain):
         p = chain[state["i"]]
         for attempt in (1, 2):
+            if STOP.is_set():          # controller pressed Stop: don't start another provider attempt
+                return None, None
             try:
                 msg = ADAPTERS[p["kind"]](p, messages)
                 if not MODELS_USED or MODELS_USED[-1] != p["name"]:
@@ -493,6 +497,7 @@ def run_agent(message, on_step=None, only=None, local_only=False, inbound_flight
     ACTION_LOG.clear()
     MODELS_USED.clear()
     CURRENT["inbound"] = None
+    STOP.clear()
 
     # Step 2 of the workshop diagram: check the input BEFORE it reaches any AI
     injection = screen_input(message)
@@ -523,7 +528,11 @@ def run_agent(message, on_step=None, only=None, local_only=False, inbound_flight
     nudges_left = MAX_REPLANS
 
     for _ in range(MAX_STEPS_LOCAL if local else MAX_STEPS):
+        if STOP.is_set():   # the controller stopped the agent: what is done stays done (every step was atomic)
+            return hand_to_human("stopped by the Operations Controller", remaining_work())
         msg, provider = call_with_fallback(messages, chain, state)
+        if msg is None and STOP.is_set():
+            return hand_to_human("stopped by the Operations Controller", remaining_work())
         if msg is None:
             return hand_to_human("every AI provider in the chain was unavailable")
         if not msg["tool_calls"]:

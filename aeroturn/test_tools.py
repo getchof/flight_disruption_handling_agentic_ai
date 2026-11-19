@@ -314,6 +314,32 @@ def test_choosing_the_same_option_twice_records_it_once():
     assert count() == 2 and costs.get_recovery_options("EK-813")["selected_by_controller"] == "C"
 
 
+def test_controller_can_stop_the_agent_between_steps():
+    """Console 'Stop agent': the run ends after the current step and the rest goes to human review.
+    No AI involved: a fake model does one step and the controller presses Stop during it."""
+    import agent
+    fresh()
+    calls = []
+
+    def fake_model(messages, chain, state):
+        calls.append(1)
+        agent.STOP.set()                    # the controller presses Stop while this step runs
+        return ({"role": "assistant", "content": "", "tool_calls": [{"id": "x1", "type": "function", "function": {
+            "name": "get_turnaround_and_crew_state", "arguments": '{"inbound_flight": "EK-812"}'}}]},
+            {"name": "fake model"})
+
+    real_model, real_screen = agent.call_with_fallback, agent.screen_input
+    agent.call_with_fallback, agent.screen_input = fake_model, (lambda m: [])
+    try:
+        out = agent.run_agent("EK-812 landed late", local_only=True, inbound_flight="EK-812")
+    finally:
+        agent.call_with_fallback, agent.screen_input = real_model, real_screen
+        agent.STOP.clear()
+    assert len(calls) == 1, "no further AI step after Stop"
+    assert "stopped by the Operations Controller" in out and "HUMAN REVIEW" in out, out
+    assert [e["tool"] for e in agent.ACTION_LOG] == ["get_turnaround_and_crew_state"], "the current step finished"
+
+
 # ---------- Bags of passengers who missed their connection ----------
 def test_missed_connection_bags_are_held_until_rebooked():
     conn = fresh()
