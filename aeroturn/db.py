@@ -134,10 +134,13 @@ FLIGHTS = [
     ("EK-513", "DXB", "BOM", "A6-ENL", "B777-300ER", "WIDE", t("17:00"), t("17:00"), t("21:25"), t("21:25"), 185, "C2", "SCHEDULED"),
     ("EK-386", "DXB", "HKG", "A6-EQC", "B777-300ER", "WIDE", t("18:30"), t("18:30"), t("05:55", 21), t("05:55", 21), 445, "C10", "SCHEDULED"),
     ("EK-555", "DXB", "DOH", "A6-EQB", "B777-300ER", "WIDE", t("12:30"), t("12:30"), t("12:45"), t("12:45"), 75, "B12", "SCHEDULED"),
+    # Later Manchester flight: where EK-813's own passengers could go if EK-813 were cancelled (option E)
+    ("EK-017", "DXB", "MAN", "A6-EQD", "B777-300ER", "WIDE", t("14:25"), t("14:25"), t("18:40"), t("18:40"), 465, "B26", "SCHEDULED"),
 ]
 
 # Free seats on each rebooking option. LHR and JFK are SHORT on seats -> priority matters.
-FREE_SEATS = {"EK-003": 20, "EK-005": 8, "EK-007": 6, "EK-203": 9, "EK-075": 16, "EK-513": 30, "EK-386": 20}
+FREE_SEATS = {"EK-003": 20, "EK-005": 8, "EK-007": 6, "EK-203": 9, "EK-075": 16, "EK-513": 30, "EK-386": 20,
+              "EK-017": 45}
 OTHER_TRAVELLERS = 12  # 'EXT' seats per flight, just so seat maps look realistic
 
 # ---------- The 45 passengers who miss their connection ----------

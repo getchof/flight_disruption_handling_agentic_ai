@@ -75,7 +75,8 @@ def test_seat_factor_changes_supply():
 def test_costs_adapt():
     build(delay_min=30, crew_duty_left_min=600, maintenance_open=False)
     opts = costs.get_recovery_options("EK-813")
-    assert [o["id"] for o in opts["options"]] == ["A", "C"], "no 'wait for crew rest' when the crew is legal"
+    # crew legal: no 'wait for crew rest' (B) or 'fallback crew' (F); nothing to fix: no aircraft swap (D)
+    assert [o["id"] for o in opts["options"]] == ["A", "C", "E"], [o["id"] for o in opts["options"]]
     assert opts["options"][0]["total_eur"] == 0 and opts["options"][0]["delay_min"] == 0
 
 

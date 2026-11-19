@@ -576,7 +576,8 @@ with tab_opt:
     st.markdown(f"<span class='chip c-blue'>⚙️ CODE prices</span><span class='chip c-blue'>🤖 AI recommends "
                 f"(see brief)</span><span class='chip c-purple'>👤 Controller chooses</span> "
                 f"<span class='muted'>{esc(r['basis'])}</span>", unsafe_allow_html=True)
-    cols = st.columns(len(r["options"]))
+    per_row = 3                                   # up to six options: two rows of three readable cards
+    cols = [c for i in range(0, len(r["options"]), per_row) for c in st.columns(per_row)]
     for col, o in zip(cols, r["options"]):
         best = o["id"] == r["lowest_cost_feasible"]
         chosen = r["selected_by_controller"] == o["id"]
@@ -592,7 +593,7 @@ with tab_opt:
               <div class="kpi" style="margin:6px 0"><div class="l">Total cost (EUR)</div>
                 <div class="v {'ok' if best else 'bad'}">{o['total_eur']:,}</div></div>
               <div class="muted">Compensation €{o['compensation_eur']:,} · care €{o['care_eur']:,} ·
-                crew €{o['operational_eur']:,}<br>{esc(OUT)} delay {o['delay_min']} min<br>
+                operations €{o['operational_eur']:,}<br>{esc(OUT)} delay {o['delay_min']} min<br>
                 Knock-on: {esc(o['knock_on'])}<br>Still needs: {esc(', '.join(o['blockers']) or 'nothing')}</div>
               </div>"""), unsafe_allow_html=True)
             label = (f"✓ Option {o['id']} chosen" if chosen else
