@@ -475,6 +475,9 @@ def act_select_plan(flight_id, option_id):
         add_step("👤 HUMAN → ⚙️ CODE", f"Recovery option {option_id} refused for {flight_id}", "blocked", r["reason"])
         ss.flash = ("warning", r["reason"])
         return
+    if r["status"] == "already_selected":
+        ss.flash = ("info", f"Option {option_id} is already the chosen plan for {flight_id}.")
+        return
     extra = (f" · pending option-A changes rejected automatically: "
              f"{', '.join('#' + str(a) for a in r['superseded_approvals'])}") if r["superseded_approvals"] else ""
     add_step("👤 HUMAN", f"Recovery option {option_id} chosen for {flight_id}", "approved",
@@ -521,9 +524,12 @@ with tab_opt:
                 crew €{o['operational_eur']:,}<br>{esc(OUT)} delay {o['delay_min']} min<br>
                 Knock-on: {esc(o['knock_on'])}<br>Still needs: {esc(', '.join(o['blockers']) or 'nothing')}</div>
               </div>"""), unsafe_allow_html=True)
-            st.button(f"Choose option {o['id']}", key=f"plan_{o['id']}", on_click=act_select_plan,
-                      args=(OUT, o["id"]), width="stretch", disabled=locked,
-                      help="Locked: option A steps are already approved" if locked else None)
+            label = (f"✓ Option {o['id']} chosen" if chosen else
+                     f"Switch to option {o['id']}" if r["selected_by_controller"] else f"Choose option {o['id']}")
+            st.button(label, key=f"plan_{o['id']}", on_click=act_select_plan,
+                      args=(OUT, o["id"]), width="stretch", disabled=locked or chosen,
+                      help="Locked: option A steps are already approved" if locked else
+                           "This option is the controller's decision" if chosen else None)
     st.markdown(f"**Connecting passengers:** {p['affected']} affected · {p['rebooked_same_day']} rebooked today · "
                 f"{p['unresolved_overnight']} overnight · compensation + care now **€{p['cost_now_eur']:,}** vs "
                 f"€{p['cost_if_nobody_rebooked_eur']:,} if nobody were rebooked → **saved €{p['saved_by_rebooking_eur']:,}**")

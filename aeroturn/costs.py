@@ -190,6 +190,8 @@ def select_recovery_plan(flight_id, option_id, controller):
       - option A steps already APPROVED  -> B or C is refused (A is being executed)
       - option A steps only PENDING      -> choosing B or C rejects them automatically"""
     conn = db.connect(T.DB)
+    if T.chosen_plan(conn, flight_id) == option_id:      # same decision again: nothing to record
+        return {"status": "already_selected", "flight": flight_id, "option": option_id, "superseded_approvals": []}
     superseded = []
     if option_id != "A":
         done = T.approved_changes(conn, flight_id)

@@ -303,6 +303,17 @@ def test_option_a_keeps_its_cost_while_being_executed():
     assert all(s.endswith("(approved)") for s in now["actions"] if not s.startswith("Engineer")), now["actions"]
 
 
+def test_choosing_the_same_option_twice_records_it_once():
+    import costs
+    conn = fresh()
+    count = lambda: conn.execute("SELECT COUNT(*) FROM audit_log WHERE action='recovery_plan_selected'").fetchone()[0]
+    assert costs.select_recovery_plan("EK-813", "A", "Controller Jane")["status"] == "selected"
+    assert costs.select_recovery_plan("EK-813", "A", "Controller Jane")["status"] == "already_selected"
+    assert count() == 1 and costs.get_recovery_options("EK-813")["selected_by_controller"] == "A"
+    assert costs.select_recovery_plan("EK-813", "C", "Controller Jane")["status"] == "selected"   # change of mind
+    assert count() == 2 and costs.get_recovery_options("EK-813")["selected_by_controller"] == "C"
+
+
 # ---------- Bags of passengers who missed their connection ----------
 def test_missed_connection_bags_are_held_until_rebooked():
     conn = fresh()
