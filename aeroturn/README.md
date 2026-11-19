@@ -23,6 +23,7 @@ python -m streamlit run app.py                       # console at http://localho
 | `python redteam.py` | 16 attacks against the guards | No (Prompt Guard optional) |
 | `python agent.py` | Full recovery in the terminal, full fallback chain | Yes |
 | `python agent.py --local` | Same, offline on Ollama qwen3:4b | Local only |
+| `python agent.py --flight EK-812` | Recover a specific late inbound flight (default: code finds the late one) | Yes |
 | `python agent.py --list-providers` | Which keys are set (never prints them) | No |
 
 ## 90-second demo script
