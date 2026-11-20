@@ -477,6 +477,44 @@ with st.expander("ℹ️ What's going on? (read this first)", expanded=not ss.ti
                 f"**🤖 The AI plans the fix · ⚙️ the code enforces the safety rules · 👤 you approve.** "
                 f"Follow the orange **Next step** bar below; it always tells you what to do.")
 
+# ---------- Which flight, and which scenario: right under the story ----------
+pick_col, wi_col = st.columns([1, 1.6], gap="medium")
+with pick_col:
+    if len(late) > 1:   # only a what-if scenario has more than one late flight: choose which one to work on
+        st.selectbox("✈️ Flight being recovered", late_ids, key="inbound",
+                     format_func=lambda f: next(f"{d['inbound']} {d['route']} +{d['delay_min']} min → "
+                                                f"{d['outbound']}" for d in late if d["inbound"] == f),
+                     help="Every late inbound flight found by code. The aircraft's next flight is found by "
+                          "its registration.")
+    else:
+        is_brief = T.current_settings() == db.DEFAULT_SCENARIO
+        current = f"{D['inbound']} {D['route']} +{D['delay_min']} min → {OUT}"
+        st.selectbox("✈️ Flight being recovered", [f"Brief: {current}" if is_brief else f"What-if: {current}"],
+                     key="disruption_view",
+                     help="The brief's scenario. To try other delays or a second late flight, open "
+                          "🔮 What-if scenarios.")
+with wi_col:
+    with st.expander("🔮 What-if scenarios: try another delay, crew, inspection or a second late flight",
+                     expanded=False):
+        cur = T.current_settings()
+        ss.setdefault("wi_delay", cur["delay_min"])
+        ss.setdefault("wi_crew", cur["crew_duty_left_min"])
+        ss.setdefault("wi_maint", cur["maintenance_open"])
+        ss.setdefault("wi_seats", cur["seats_factor"])
+        ss.setdefault("wi_second", cur["second_disruption"])
+        st.selectbox("Preset", list(SCENARIOS), key="wi_preset", on_change=act_pick_preset)
+        st.slider("EK-812 delay (min)", 0, 180, step=5, key="wi_delay")
+        st.slider("Inbound crew duty left at landing (min)", 0, 720, step=10, key="wi_crew",
+                  help="EK-813 needs 465 min flight + 30 min post-flight = 495 min after departure.")
+        st.toggle("Hydraulic inspection M-1001 still open", key="wi_maint")
+        st.slider("Free seats on rebooking flights (x)", 0.0, 2.0, step=0.25, key="wi_seats")
+        st.toggle("Add a second late flight (EK-433 from Singapore)", key="wi_second",
+                  help="A different case at the same time: legal crew, free gate, no maintenance - only a short "
+                       "delay is needed.")
+        st.button("🔁 Build this scenario", on_click=act_build_scenario, width="stretch", type="secondary",
+                  disabled=BUSY, help=BUSY_HELP if BUSY else None)
+        st.caption("Rebuilds the database. Rules, critical path, costs and the AI all adapt; nothing is hard-coded.")
+
 if ss.flash:
     getattr(st, ss.flash[0])(ss.flash[1])
     ss.flash = None
@@ -532,12 +570,6 @@ with left:
 
     # ---- Advanced (collapsed) ----
     with st.expander("⚙️ Advanced settings", expanded=False):
-        is_brief = T.current_settings() == db.DEFAULT_SCENARIO
-        current = f"{D['inbound']} {D['route']} +{D['delay_min']} min → {OUT}"
-        st.selectbox("Disruption", [f"Brief: {current}" if is_brief else f"What-if: {current}"],
-                     key="disruption_view",
-                     help="The brief's scenario. To try other delays or a second late flight, use the "
-                          "What-if scenarios below.")
         providers = agent.available_providers()
         options = ["Auto · full fallback chain"] + [p["name"] for p in providers] + ["Local only (Ollama)"]
         choice = st.selectbox("AI provider", options, help="Auto tries each provider in order until one answers.")
@@ -552,31 +584,6 @@ with left:
         message = st.text_area("Message text", value=presets[preset], height=100,
                                key=f"msg_{preset}_{D['inbound']}_{D['delay_min']}")
 
-    with st.expander("🔮 What-if scenarios", expanded=False):
-        cur = T.current_settings()
-        ss.setdefault("wi_delay", cur["delay_min"])
-        ss.setdefault("wi_crew", cur["crew_duty_left_min"])
-        ss.setdefault("wi_maint", cur["maintenance_open"])
-        ss.setdefault("wi_seats", cur["seats_factor"])
-        ss.setdefault("wi_second", cur["second_disruption"])
-        st.selectbox("Preset", list(SCENARIOS), key="wi_preset", on_change=act_pick_preset)
-        st.slider("EK-812 delay (min)", 0, 180, step=5, key="wi_delay")
-        st.slider("Inbound crew duty left at landing (min)", 0, 720, step=10, key="wi_crew",
-                  help="EK-813 needs 465 min flight + 30 min post-flight = 495 min after departure.")
-        st.toggle("Hydraulic inspection M-1001 still open", key="wi_maint")
-        st.slider("Free seats on rebooking flights (x)", 0.0, 2.0, step=0.25, key="wi_seats")
-        st.toggle("Add a second late flight (EK-433 from Singapore)", key="wi_second",
-                  help="A different case at the same time: legal crew, free gate, no maintenance - only a short "
-                       "delay is needed.")
-        st.button("🔁 Build this scenario", on_click=act_build_scenario, width="stretch", type="secondary",
-                  disabled=BUSY, help=BUSY_HELP if BUSY else None)
-        st.caption("Rebuilds the database. Rules, critical path, costs and the AI all adapt; nothing is hard-coded.")
-        if len(late) > 1:   # only a what-if scenario has more than one late flight: choose which one to work on
-            st.selectbox("Work on disruption", late_ids, key="inbound",
-                         format_func=lambda f: next(f"{d['inbound']} {d['route']} +{d['delay_min']} min → "
-                                                    f"{d['outbound']}" for d in late if d["inbound"] == f),
-                         help="Every late inbound flight found by code. The aircraft's next flight is found by "
-                              "its registration.")
 
 
 # ---------- Centre: timeline + brief ----------
