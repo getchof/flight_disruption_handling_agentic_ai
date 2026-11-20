@@ -9,7 +9,7 @@ AI providers are tried ONE AT A TIME, in the order of PROVIDERS below. If one is
 busy, out of quota, has no key, or times out (30 s), the next one takes over and
 continues the same conversation (nothing is redone).
 
-RUN (from the aeroturn folder)
+RUN (from the project folder)
   python agent.py                       # full fallback chain
   python agent.py --provider groq       # only providers whose name contains "groq"
   python agent.py --local               # only local Ollama models (offline, free)
@@ -17,7 +17,7 @@ RUN (from the aeroturn folder)
   python agent.py --message "..."       # custom disruption text (checked for injection first)
   python agent.py --flight EK-812       # which late inbound flight to recover (default: found by code)
 
-Keys go in the .env file in the agent folder (see .env.example). Never print them.
+Keys go in the .env file in the project folder (see .env.example). Never print them.
 """
 import inspect
 import json
@@ -37,8 +37,8 @@ import db
 import guards as g
 import tools as T
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")  # agent/.env
-load_dotenv()                                                    # or a .env next to this file
+load_dotenv(Path(__file__).resolve().parent / ".env")         # .env next to this file (project root)
+load_dotenv()                                                    # or a .env in the current folder
 
 TIMEOUT_S = 30           # cloud call timeout (workshop advice: never let one call freeze the agent)
 LOCAL_TIMEOUT_S = 600    # local CPU models are slow

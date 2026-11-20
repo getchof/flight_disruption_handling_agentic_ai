@@ -39,26 +39,24 @@ database directly and never approves anything. Every change goes through one wri
 ## 2. File-by-file structure
 
 ```
-agent/
-├── .env                 # API keys (never committed, never read by the coding agent)
-├── .env.example         # key names + where to get them
-├── .gitignore           # .env, *.sqlite, __pycache__
-└── aeroturn/
-    ├── PLAN.md          # this file
-    ├── README.md        # setup + 90-second demo script + judge Q&A
-    ├── requirements.txt
-    ├── .streamlit/config.toml   # dark navy/amber theme, Deploy button hidden
-    ├── db.py            # schema, seeded scenario, integrity checks, hash-chained audit
-    ├── guards.py        # immutable safety rules (pure Python, no DB, no LLM)
-    ├── turnaround.py    # critical-path method for the ground turnaround
-    ├── tools.py         # agent tools + single write gateway + human actions
-    ├── costs.py         # recovery options + EU261-style compensation
-    ├── agent.py         # LLM loop, provider fallback, input screening, checklist guard
-    ├── redteam.py       # 17 attacks on a fresh copy of the scenario
-    ├── app.py           # Streamlit OCC console
-    ├── test_guards.py   # 21 tests: rules + database (no AI)
-    ├── test_tools.py    # 19 tests: services, rollback, approval gate (no AI)
-    └── test_whatif.py   # 10 tests: other delays / crew / maintenance / seats (no AI)
+flight_disruption_handling_agentic_ai/
+├── README.md            # setup + 90-second demo script + judge Q&A
+├── PLAN.md              # this file
+├── requirements.txt
+├── .env.example         # key names (copy to .env; .env is never committed)
+├── .gitignore           # .env, *.sqlite, __pycache__, local tool folders
+├── .streamlit/config.toml   # dark navy/amber theme, Deploy button hidden
+├── db.py                # schema, seeded scenario, integrity checks, hash-chained audit
+├── guards.py            # immutable safety rules (pure Python, no DB, no LLM)
+├── turnaround.py        # critical-path method for the ground turnaround
+├── tools.py             # agent tools + single write gateway + human actions
+├── costs.py             # recovery options A-F + EU261-style compensation
+├── agent.py             # LLM loop, provider fallback, input screening, checklist guard
+├── app.py               # Streamlit OCC console (agent runs in a background thread)
+├── redteam.py           # 19 attacks on a fresh copy of the scenario
+├── test_guards.py       # 21 tests: rules + database (no AI)
+├── test_tools.py        # 30 tests: services, rollback, approvals, options (no AI)
+└── test_whatif.py       # 13 tests: other delays, crew, maintenance, seats, second disruption (no AI)
 ```
 
 | File | Responsibility | Key functions | Connections |

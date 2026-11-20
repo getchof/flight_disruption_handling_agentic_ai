@@ -9,22 +9,25 @@ crew and maintenance floors **in code**, and needs a **human controller** for ev
 ## Run it
 
 ```powershell
-cd aeroturn
+git clone https://github.com/getchof/flight_disruption_handling_agentic_ai.git
+cd flight_disruption_handling_agentic_ai
 python -m venv .venv ; .venv\Scripts\activate      # optional
 pip install -r requirements.txt
-copy ..\.env.example ..\.env                         # then paste your own keys into ..\.env
+copy .env.example .env                               # then paste your own keys into .env (all optional)
 python -m streamlit run app.py                       # console at http://localhost:8501
 ```
+
+The safety demos (blocked departure, atomic rollback, approvals, red team) work without any API key; only the AI run needs one.
 
 | Command | What it does | Needs AI? |
 |---|---|---|
 | `python test_guards.py` | 21 rule + database tests | No |
-| `python test_tools.py` | 19 service, rollback and approval tests | No |
-| `python redteam.py` | 17 attacks against the guards | No (Prompt Guard optional) |
+| `python test_tools.py` | 30 service, rollback, approval and option tests | No |
+| `python redteam.py` | 19 attacks against the guards | No (Prompt Guard optional) |
 | `python agent.py` | Full recovery in the terminal, full fallback chain | Yes |
 | `python agent.py --local` | Same, offline on Ollama qwen3:4b | Local only |
 | `python agent.py --delay 150 --crew-left 600` | What-if: a different delay / crew situation | Yes |
-| `python test_whatif.py` | 10 tests: rules, costs and rollback adapt to other scenarios | No |
+| `python test_whatif.py` | 13 tests: rules, costs and rollback adapt to other scenarios | No |
 | `python agent.py --flight EK-812` | Recover a specific late inbound flight (default: code finds the late one) | Yes |
 | `python agent.py --list-providers` | Which keys are set (never prints them) | No |
 

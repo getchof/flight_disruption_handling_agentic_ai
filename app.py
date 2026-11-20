@@ -1,7 +1,7 @@
 """
 AeroTurn - Operations Control Centre (OCC) console.                  [UI + HUMAN]
 
-RUN (from the aeroturn folder)
+RUN (from the project folder)
   python -m streamlit run app.py
 
 Every step on screen is labelled with WHO did it:
