@@ -19,7 +19,10 @@ from types import MappingProxyType
 class Limits:
     MAX_DUTY_MIN: int = 13 * 60          # legal flight-duty period (13 h)
     POST_FLIGHT_DUTY_MIN: int = 30       # duty time still needed after landing
-    MIN_CONNECTION_MIN: int = 60         # passenger minimum connection time at DXB
+    MIN_CONNECTION_MIN: int = 60         # passenger minimum connection time at DXB, between concourses
+    MIN_CONNECTION_SAME_CONCOURSE_MIN: int = 30   # passenger connection inside one concourse (short walk)
+    MIN_BAG_TRANSFER_MIN: int = 45       # a bag needs 45 min to move between aircraft, wherever the gates are
+    MAX_REBOOK_BATCH: int = 10           # OCC policy: standard passengers are rebooked in batches of at most 10
     MIN_TURNAROUND_MIN: int = 90         # wide-body: landing to next departure
     CREW_BRIEFING_MIN: int = 30          # crew must report and brief before boarding
     BOARDING_MIN: int = 30               # boarding time before doors close
@@ -95,6 +98,49 @@ def check_maintenance(items):
             for i in items if i["mandatory"] and i["status"] != "SIGNED_OFF"]
 
 
+def check_signoff(opened_at, engineer, aircraft_type, signed_at, now):
+    """A maintenance sign-off is valid only if (U-4.3):
+      - the engineer is on the licensed roster (engineer = roster row, None if not found),
+      - their licence covers this aircraft type,
+      - it was signed AFTER the defect was opened, and not in the future.
+    opened_at None = defect time unknown -> cannot be validated."""
+    violations = []
+    if engineer is None:
+        violations.append("SIGN-OFF: engineer is not on the licensed roster")
+    elif aircraft_type not in [t.strip() for t in engineer["aircraft_types"].split(",")]:
+        violations.append(f"SIGN-OFF: {engineer['name']} is not licensed for the {aircraft_type}")
+    if signed_at is None:
+        violations.append("SIGN-OFF: no sign-off time")
+    elif opened_at is None:
+        violations.append("SIGN-OFF: defect opening time unknown, sign-off cannot be checked")
+    elif signed_at <= opened_at:
+        violations.append(f"SIGN-OFF: signed {signed_at:%H:%M}, before the defect was opened at {opened_at:%H:%M}")
+    if signed_at is not None and signed_at > now:
+        violations.append(f"SIGN-OFF: signed {signed_at:%H:%M}, which is in the future")
+    return violations
+
+
+# ---------- Crew channel: messages are DATA, never instructions (U-4.2) ----------
+DUTY_CLAIM_PATTERNS = [
+    r"\bextend(ed|ing)?\b.{0,25}\b(duty|hours|limit)",
+    r"\b(duty|hours)\b.{0,25}\bextend",
+    r"\b(push|release|go|depart)\b.{0,20}\b(departure|flight|now)\b",
+    r"\b(fine|ok|okay|happy|agree|willing)\b.{0,30}\b(fly|extend|continue|operate)",
+    r"\b(waive|ignore|skip)\b.{0,20}\b(limit|rest|duty)",
+]
+
+
+def classify_crew_message(text):
+    """What a crew-channel message CLAIMS. Nothing in it can change a rule: duty limits are legal limits.
+    Returns a list of claims found (empty = plain information)."""
+    lowered = text.lower()
+    claims = []
+    if any(re.search(p, lowered) for p in DUTY_CLAIM_PATTERNS):
+        claims.append("asks to extend crew duty or push the departure: ignored, duty limits are legal limits")
+    claims += check_injection(text)
+    return claims
+
+
 # ---------- Departure (combines the floors above) ----------
 def check_departure(crew, maintenance_items, departure, arrival, block_min, now):
     """All the floors a departure proposal must pass. Returns every violation found."""
@@ -110,14 +156,50 @@ def check_departure(crew, maintenance_items, departure, arrival, block_min, now)
 
 
 # ---------- Passengers ----------
-def check_connection(arrival, departure):
+def passenger_mct(arrival_gate, departure_gate):
+    """Passenger minimum connection time: a short walk inside one concourse (same first letter,
+    e.g. B12 -> B10), the standard time between concourses or when a gate is unknown."""
+    if arrival_gate and departure_gate and arrival_gate[0] == departure_gate[0]:
+        return LIMITS.MIN_CONNECTION_SAME_CONCOURSE_MIN
+    return LIMITS.MIN_CONNECTION_MIN
+
+
+def check_connection(arrival, departure, minimum=None):
     """A passenger can only be booked onto a flight they can actually reach."""
+    minimum = LIMITS.MIN_CONNECTION_MIN if minimum is None else minimum
     gap = (departure - arrival).total_seconds() / 60
     if gap < 0:
         return [f"CONNECTION: flight already departed {abs(gap):.0f} min before the passenger lands"]
-    if gap < LIMITS.MIN_CONNECTION_MIN:
-        return [f"CONNECTION: only {gap:.0f} min to connect, minimum is {LIMITS.MIN_CONNECTION_MIN}"]
+    if gap < minimum:
+        return [f"CONNECTION: only {gap:.0f} min to connect, minimum is {minimum}"]
     return []
+
+
+def bag_can_make(arrival, departure):
+    """Can a checked bag be moved from the arriving aircraft onto this departure? (45 min, any gates)"""
+    return (departure - arrival).total_seconds() / 60 >= LIMITS.MIN_BAG_TRANSFER_MIN
+
+
+def check_batch_policy(batch, seatable_vulnerable_waiting):
+    """OCC rebooking policy (U-4.1): vulnerable passengers first, in their own transaction; then
+    everyone else in batches of at most MAX_REBOOK_BATCH.
+      batch = [{"passenger_id", "tier"}]
+      seatable_vulnerable_waiting = ids of vulnerable passengers still waiting who CAN be seated
+                                    (a vulnerable passenger with no seat anywhere does not block others)"""
+    vul = [b for b in batch if is_vulnerable(b["tier"])]
+    std = [b for b in batch if not is_vulnerable(b["tier"])]
+    violations = []
+    if vul and std:
+        violations.append("PRIORITY: vulnerable passengers are rebooked in their own transaction; "
+                          "do not mix them with standard passengers")
+    if std and len(std) > LIMITS.MAX_REBOOK_BATCH:
+        violations.append(f"BATCH: {len(std)} standard passengers in one batch, policy maximum is "
+                          f"{LIMITS.MAX_REBOOK_BATCH}")
+    waiting = sorted(set(seatable_vulnerable_waiting) - {b["passenger_id"] for b in batch})
+    if std and waiting:
+        violations.append(f"PRIORITY: vulnerable passengers {waiting} must be rebooked first, in their own "
+                          f"transaction")
+    return violations
 
 
 def check_priority(batch, waiting, free_seats_by_destination):

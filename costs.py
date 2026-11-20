@@ -63,17 +63,19 @@ def passenger_recovery(inbound_flight):
     """Cost of the CONNECTING passengers of one late inbound flight right now, versus doing
     nothing (everyone flies tomorrow)."""
     conn = db.connect(T.DB)
-    arrival = db.to_time(conn.execute("SELECT est_arr FROM flights WHERE flight_id=?",
-                                      (inbound_flight,)).fetchone()[0])
+    arrival, arrival_gate = conn.execute("SELECT est_arr, gate FROM flights WHERE flight_id=?",
+                                         (inbound_flight,)).fetchone()
+    arrival = db.to_time(arrival)
     rows = conn.execute(
         "SELECT p.final_destination AS dest, p.original_onward AS orig, o.est_dep AS orig_dep, o.sched_arr AS orig_arr, "
+        "o.gate AS orig_gate, "
         "s.flight_id AS now_on, n.est_arr AS new_arr FROM passengers p "
         "JOIN flights o ON o.flight_id = p.original_onward "
         "JOIN seats s ON s.occupant = p.passenger_id JOIN flights n ON n.flight_id = s.flight_id "
         "WHERE p.inbound_flight = ?", (inbound_flight,)).fetchall()
     now_cost = nothing_cost = rebooked = unresolved = 0
     for r in rows:
-        if not g.check_connection(arrival, db.to_time(r["orig_dep"])):
+        if not db.connection_problems(arrival, arrival_gate, db.to_time(r["orig_dep"]), r["orig_gate"]):
             continue                                   # this passenger never missed their connection
         km = distance_km(r["dest"])
         tomorrow = compensation(km, 24 * 60) + care(24 * 60, overnight=True)

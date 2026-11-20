@@ -61,14 +61,41 @@ CREATE TABLE gates (gate_id TEXT PRIMARY KEY, concourse TEXT, wide_body INTEGER)
 CREATE TABLE gate_bookings (gate_id TEXT, flight_id TEXT, start TEXT, "end" TEXT);
 
 -- Human-in-the-loop queue: schedule, gate and crew changes wait here for the Operations Controller
+-- state_hash / state_seen (U-4.5): fingerprint of the facts the change depends on, and those facts in words,
+-- as the controller saw them. At execution the fingerprint is recomputed; if it changed, the approval is stale.
 CREATE TABLE pending_approvals (
     approval_id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, payload TEXT, reason TEXT,
-    status TEXT, requested_by TEXT, requested_at TEXT, decided_by TEXT, decided_at TEXT);
+    status TEXT, requested_by TEXT, requested_at TEXT, decided_by TEXT, decided_at TEXT,
+    state_hash TEXT, state_seen TEXT);
 
 -- The what-if settings this database was built with, plus "now" (the scenario clock = landing time)
 CREATE TABLE scenario (key TEXT PRIMARY KEY, value TEXT);
 
 CREATE TABLE notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, passenger_id TEXT, text TEXT);
+
+-- Licensed engineer roster (U-4.3): only these people can sign off, and only for their aircraft types
+CREATE TABLE engineers (engineer_id TEXT PRIMARY KEY, name TEXT, licence TEXT, aircraft_types TEXT);
+-- When each defect was opened: a sign-off dated before this is impossible
+CREATE TABLE maintenance_defects (item_id TEXT PRIMARY KEY, opened_at TEXT, reported_by TEXT);
+-- Every sign-off ATTEMPT (console or maintenance-system feed), valid or not, with the reason
+CREATE TABLE maintenance_signoffs (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT, engineer_id TEXT,
+    signed_at TEXT, source TEXT, valid INTEGER, reason TEXT);
+
+-- Planned bag separation (U-4.4): the bag follows on a later flight to the same city, with a delivery note
+CREATE TABLE bag_plans (bag_tag TEXT PRIMARY KEY, passenger_id TEXT, routed_to TEXT, note TEXT);
+
+-- Crew channel (U-4.2): free text from people. It is DATA for the AI, never an instruction.
+CREATE TABLE crew_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, flight_id TEXT, author TEXT, text TEXT);
+
+-- Alerts for humans: maintenance control, the Operations Controller
+CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, area TEXT, text TEXT);
+
+-- Duty counters are READ-ONLY (U-4.2): once a crew member's duty has started, nothing - not the AI,
+-- not a message, not raw SQL - may move that start time. A standby member's first call-out (NULL -> time)
+-- is the only allowed write.
+CREATE TRIGGER duty_counters_read_only BEFORE UPDATE OF duty_start ON crew
+WHEN OLD.duty_start IS NOT NULL AND (NEW.duty_start IS NULL OR NEW.duty_start <> OLD.duty_start)
+BEGIN SELECT RAISE(ABORT, 'DUTY: duty counters are read-only'); END;
 
 -- actor = AI, CODE or HUMAN, so the demo shows who did what.
 -- Tamper-evident: each row stores hash = SHA-256(previous row's hash + this row's content).
@@ -118,9 +145,9 @@ FLIGHTS = [
     # Onward flights the 45 passengers MISS (they leave before 10:15 + 60 min)
     ("EK-201", "DXB", "JFK", "A6-EGA", "B777-300ER", "WIDE", t("10:30"), t("10:30"), t("16:40"), t("16:40"), 850, "A10", "BOARDING"),
     ("EK-001", "DXB", "LHR", "A6-EUB", "A380-800", "WIDE", t("10:45"), t("10:45"), t("14:55"), t("14:55"), 490, "A1", "BOARDING"),
-    ("EK-073", "DXB", "CDG", "A6-EPD", "B777-300ER", "WIDE", t("11:00"), t("11:00"), t("15:50"), t("15:50"), 410, "B20", "BOARDING"),
+    ("EK-073", "DXB", "CDG", "A6-EPD", "B777-300ER", "WIDE", t("11:00"), t("11:00"), t("15:50"), t("15:50"), 410, "C20", "BOARDING"),
     # Onward flights the other 235 passengers still make
-    ("EK-511", "DXB", "BOM", "A6-ENK", "B777-300ER", "WIDE", t("12:00"), t("12:00"), t("16:25"), t("16:25"), 185, "B6", "SCHEDULED"),
+    ("EK-511", "DXB", "BOM", "A6-ENK", "B777-300ER", "WIDE", t("12:00"), t("12:00"), t("16:25"), t("16:25"), 185, "C6", "SCHEDULED"),
     ("EK-384", "DXB", "HKG", "A6-EQA", "B777-300ER", "WIDE", t("12:30"), t("12:30"), t("23:55"), t("23:55"), 445, "C8", "SCHEDULED"),
     ("EK-412", "DXB", "SYD", "A6-EUC", "A380-800", "WIDE", t("13:30"), t("13:30"), t("09:05", 21), t("09:05", 21), 815, "A5", "SCHEDULED"),
     ("EK-061", "DXB", "HAM", "A6-EGB", "B777-300ER", "WIDE", t("14:00"), t("14:00"), t("18:30"), t("18:30"), 410, "B30", "SCHEDULED"),
@@ -185,6 +212,13 @@ MAINTENANCE = [
     ("M-1001", "A6-EQX", "Hydraulic system B pressure loss - inspection required", 1, "OPEN", None, None),
     ("M-1002", "A6-EQX", "Cabin reading light 34C inoperative (deferred, MEL)", 0, "DEFERRED", None, None),
 ]
+# Licensed engineer roster: (engineer_id, name, licence, aircraft types the licence covers)
+ENGINEERS = [
+    ("E-101", "Eng. Omar Farouk", "B1", "B777-300ER,A380-800"),
+    ("E-102", "Eng. Lina Haddad", "B1", "A380-800"),             # licensed, but NOT for the 777
+    ("E-103", "Eng. Ravi Menon", "B1", "B777-300ER"),
+]
+M1001_OPENED_BEFORE_LANDING_MIN = 35   # the crew reported the hydraulic defect by ACARS 35 min before landing
 
 GATES = [("B12", "B", 1), ("A3", "A", 1), ("A4", "A", 1), ("C40", "C", 0), ("B14", "B", 1)]
 GATE_BOOKINGS = [
@@ -213,6 +247,9 @@ DEFAULT_SCENARIO = {
 EK812_SCHED_ARR = "2026-11-20 09:00"
 
 
+SCHEMA_VERSION = 2   # bump when SCHEMA changes: an older demo database is rebuilt on first connect
+
+
 def build(path=DB_PATH, **settings):
     """Delete and rebuild the database for a scenario. With no settings it is exactly the
     brief's scenario (75 min late, crew 20 min from the limit, M-1001 open). Returns the path."""
@@ -228,6 +265,7 @@ def build(path=DB_PATH, **settings):
         conn.execute(f'DROP {kind.upper()} IF EXISTS "{name}"')
     conn.commit()
     conn.executescript(SCHEMA)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.executemany("INSERT INTO scenario VALUES (?,?)",
                      [(k, str(v)) for k, v in s.items()] + [("now", landed.strftime(TIME_FMT))])
 
@@ -296,8 +334,16 @@ def build(path=DB_PATH, **settings):
     conn.executemany("INSERT INTO crew VALUES (?,?,?,?,?,?,?,?)", crew)
 
     maintenance = list(MAINTENANCE)
-    if str(s["maintenance_open"]) in ("False", "0"):   # what-if: inspection already signed off
-        maintenance[0] = MAINTENANCE[0][:4] + ("SIGNED_OFF", "Eng. on duty (before arrival)", landed.strftime(TIME_FMT))
+    opened = landed - timedelta(minutes=M1001_OPENED_BEFORE_LANDING_MIN)
+    conn.executemany("INSERT INTO engineers VALUES (?,?,?,?)", ENGINEERS)
+    conn.executemany("INSERT INTO maintenance_defects VALUES (?,?,?)", [
+        ("M-1001", opened.strftime(TIME_FMT), "EK-812 crew (ACARS)"),
+        ("M-1002", (landed - timedelta(days=2)).strftime(TIME_FMT), "Cabin crew log")])
+    if str(s["maintenance_open"]) in ("False", "0"):   # what-if: inspection already (validly) signed off
+        signed = (landed - timedelta(minutes=10)).strftime(TIME_FMT)
+        maintenance[0] = MAINTENANCE[0][:4] + ("SIGNED_OFF", "Eng. Omar Farouk", signed)
+        conn.execute("INSERT INTO maintenance_signoffs (item_id, engineer_id, signed_at, source, valid, reason) "
+                     "VALUES ('M-1001','E-101',?,'line maintenance (before arrival)',1,'valid')", (signed,))
     conn.executemany("INSERT INTO maintenance_log VALUES (?,?,?,?,?,?,?)", maintenance)
     conn.executemany("INSERT INTO gates VALUES (?,?,?)", GATES)
     conn.executemany("INSERT INTO gate_bookings VALUES (?,?,?,?)", GATE_BOOKINGS)
@@ -344,6 +390,10 @@ def connect(path=DB_PATH):
     if not Path(path).exists():
         build(path)
     conn = sqlite3.connect(path, isolation_level=None)
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:   # made by an older AeroTurn
+        conn.close()
+        build(path)
+        conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -375,25 +425,40 @@ def double_bookings(conn):
 
 
 def orphan_bags(conn):
-    """Bags separated from their passenger. Must always be empty. Either:
-      - routed to a flight their passenger has no seat on, or
-      - HELD at the hub although their passenger was already rebooked (left behind)."""
+    """Bags separated from their passenger WITHOUT a plan. Must always be empty. Either:
+      - routed to a flight their passenger has no seat on (and not a planned FOLLOWING bag), or
+      - HELD at the hub although their passenger was already rebooked (left behind), or
+      - FOLLOWING without a delivery plan to the passenger's own destination.
+    A bag that cannot make a short connection may follow on a later flight to the same city with a
+    delivery note (U-4.4): that is a plan, not an orphan."""
     return [r["bag_tag"] for r in conn.execute(
-        "SELECT b.bag_tag FROM bags b WHERE b.status <> 'HELD' AND NOT EXISTS ("
+        "SELECT b.bag_tag FROM bags b WHERE b.status NOT IN ('HELD','FOLLOWING') AND NOT EXISTS ("
         "  SELECT 1 FROM seats s WHERE s.occupant = b.passenger_id AND s.flight_id = b.routed_to) "
         "UNION SELECT b.bag_tag FROM bags b JOIN passengers p ON p.passenger_id = b.passenger_id "
         "  JOIN seats s ON s.occupant = p.passenger_id "
-        "WHERE b.status = 'HELD' AND s.flight_id <> p.original_onward")]
+        "WHERE b.status = 'HELD' AND s.flight_id <> p.original_onward "
+        "UNION SELECT b.bag_tag FROM bags b JOIN passengers p ON p.passenger_id = b.passenger_id "
+        "WHERE b.status = 'FOLLOWING' AND NOT EXISTS ("
+        "  SELECT 1 FROM bag_plans bp JOIN flights f ON f.flight_id = bp.routed_to "
+        "  WHERE bp.bag_tag = b.bag_tag AND bp.routed_to = b.routed_to AND f.destination = p.final_destination "
+        "  AND bp.note IS NOT NULL AND bp.note <> '')")]
+
+
+def connection_problems(arrival, arrival_gate, departure, departure_gate):
+    """Can a passenger landing at arrival_gate make a departure from departure_gate? (rules in guards.py)"""
+    from guards import check_connection, passenger_mct
+    return check_connection(arrival, departure, passenger_mct(arrival_gate, departure_gate))
 
 
 def missed_connections(conn):
     """Passengers whose onward flight leaves before they can connect (rule from guards.py)."""
-    from guards import check_connection
-    arrival = {r["flight_id"]: to_time(r["est_arr"]) for r in conn.execute("SELECT flight_id, est_arr FROM flights")}
+    inbound = {r["flight_id"]: (to_time(r["est_arr"]), r["gate"])
+               for r in conn.execute("SELECT flight_id, est_arr, gate FROM flights")}
     rows = conn.execute(
-        "SELECT p.*, f.est_dep FROM passengers p JOIN seats s ON s.occupant = p.passenger_id "
+        "SELECT p.*, f.est_dep, f.gate AS dep_gate FROM passengers p JOIN seats s ON s.occupant = p.passenger_id "
         "JOIN flights f ON f.flight_id = s.flight_id WHERE s.flight_id = p.original_onward").fetchall()
-    return [dict(r) for r in rows if check_connection(arrival[r["inbound_flight"]], to_time(r["est_dep"]))]
+    return [dict(r) for r in rows if connection_problems(*inbound[r["inbound_flight"]],
+                                                         to_time(r["est_dep"]), r["dep_gate"])]
 
 
 if __name__ == "__main__":

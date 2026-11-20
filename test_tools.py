@@ -15,7 +15,7 @@ def fresh():
     """Point the tools at a brand-new database and return a connection to it."""
     T.DB = Path(tempfile.mkdtemp()) / "aeroturn_test.sqlite"
     db.build(T.DB)
-    T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = False
+    T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = T.SIMULATE_BATCH_CONFLICT["enabled"] = False
     return db.connect(T.DB)
 
 
@@ -26,6 +26,12 @@ def missed(state, dest=None, vulnerable=None):
     if vulnerable is not None:
         out = [p for p in out if (p["tier"] != "STANDARD") == vulnerable]
     return [p["passenger_id"] for p in out]
+
+
+def vulnerable_batch(state, dest="LHR"):
+    """A batch the OCC policy allows: the vulnerable passengers to one destination, on its first bookable flight."""
+    flight = next(o["flight_id"] for o in state["rebooking_options"][dest] if o["bookable"])
+    return missed(state, dest, vulnerable=True), flight
 
 
 # ---------- Tool 1: state ----------
@@ -91,16 +97,16 @@ def test_wrong_destination_and_duplicates_blocked():
 
 def test_midway_seat_conflict_rolls_back_everything():
     conn = fresh()
-    s = T.get_turnaround_and_crew_state()
-    batch = missed(s, "CDG")[:6]
+    batch, flight = vulnerable_batch(T.get_turnaround_and_crew_state())
+    assert len(batch) >= 4
     before = T.snapshot(conn)
     T.SIMULATE_SEAT_CONFLICT.update(enabled=True, at_item=4)
-    r = T.execute_atomic_passenger_rebook(batch, "EK-075")
+    r = T.execute_atomic_passenger_rebook(batch, flight)
     assert r["status"] == "rolled_back" and r["items_done_before_failure"] == 3, r
     assert T.snapshot(conn) == before, "rollback must leave seats and bags exactly as they were"
     assert T.integrity(conn) == {"double_bookings": 0, "orphan_bags": 0}
     T.SIMULATE_SEAT_CONFLICT["enabled"] = False                      # same batch now succeeds
-    assert T.execute_atomic_passenger_rebook(batch, "EK-075")["status"] == "committed"
+    assert T.execute_atomic_passenger_rebook(batch, flight)["status"] == "committed"
 
 
 # ---------- Tool 3: guards + human approval gate ----------
@@ -198,8 +204,9 @@ def test_approval_rechecks_guards():
     assert r["status"] == "pending_controller_approval", r
     # Something changes after staging: a new mandatory defect is found before approval
     conn.execute("INSERT INTO maintenance_log VALUES ('M-1003','A6-EQX','Bird strike check',1,'OPEN',NULL,NULL)")
+    # The approval is bound to the maintenance state shown (U-4.5): refused, re-checked, still blocked
     a = T.approve(r["approval_id"], "Controller Jane")
-    assert a["status"] == "refused_by_guard" and "M-1003" in a["violations"][0], a
+    assert a["status"] == "stale_blocked" and any("M-1003" in v for v in a["violations"]), a
     assert conn.execute("SELECT status FROM flights WHERE flight_id='EK-813'").fetchone()[0] != "RELEASED"
 
 
@@ -275,15 +282,15 @@ def test_midway_bag_transfer_failure_rolls_back_everything():
         conn = fresh()
         if held:
             T.hold_missed_bags()
-        batch = missed(T.get_turnaround_and_crew_state(), "CDG")[:6]
+        batch, flight = vulnerable_batch(T.get_turnaround_and_crew_state())
         before = T.snapshot(conn)
         T.SIMULATE_BAG_CONFLICT.update(enabled=True, at_item=3)
-        r = T.execute_atomic_passenger_rebook(batch, "EK-075")
+        r = T.execute_atomic_passenger_rebook(batch, flight)
         T.SIMULATE_BAG_CONFLICT["enabled"] = False
         assert r["status"] == "rolled_back" and "orphan_bags" in r["reason"], (held, r)
         assert T.snapshot(conn) == before, "rollback must leave seats and bags exactly as they were"
         assert T.integrity(conn) == {"double_bookings": 0, "orphan_bags": 0}
-        assert T.execute_atomic_passenger_rebook(batch, "EK-075")["status"] == "committed"
+        assert T.execute_atomic_passenger_rebook(batch, flight)["status"] == "committed"
 
 
 def test_option_a_keeps_its_cost_while_being_executed():
@@ -462,8 +469,8 @@ def test_any_late_flight_not_just_ek812():
     assert T.get_turnaround_and_crew_state()["status"] == "error", "two disruptions: must say which one"
 
     # Rebooking uses EK-433's own landing time; guards still apply (vulnerable first)
-    r = T.execute_atomic_passenger_rebook(missed(s, "CDG"), "EK-075")
-    assert r["status"] == "committed" and len(r["rebooked"]) == 3, r
+    r = T.execute_rebooking_plan("EK-433")
+    assert [b["kind"] for b in r["batches"]] == ["vulnerable", "standard"] and r["rebooked"] == 3, r
     assert T.integrity(conn) == {"double_bookings": 0, "orphan_bags": 0}
     note = T.send_passenger_notification(["Q001"], "")["messages"]["Q001"]
     assert note.startswith("EK-433 landed late") and "EK-075" in note, note

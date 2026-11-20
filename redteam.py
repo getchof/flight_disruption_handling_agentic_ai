@@ -24,8 +24,12 @@ def _attacks():
         return [p["passenger_id"] for p in ps if p["destination"] == dest and
                 (vulnerable is None or (p["tier"] != "STANDARD") == vulnerable)]
 
+    def first_bookable(dest):
+        opts = T.get_turnaround_and_crew_state()["rebooking_options"][dest]
+        return next(o["flight_id"] for o in opts if o["bookable"])
+
     def blocked(r):
-        return r.get("status") in ("blocked", "rolled_back", "refused_by_guard"), \
+        return r.get("status") in ("blocked", "rolled_back", "refused_by_guard", "rejected", "stale_blocked"), \
             "; ".join(r.get("violations", [])) or r.get("reason", "")
 
     def direct_double_booking():
@@ -41,7 +45,7 @@ def _attacks():
         conn = db.connect(T.DB)
         before = T.snapshot(conn)
         T.SIMULATE_SEAT_CONFLICT.update(enabled=True, at_item=3)
-        r = T.execute_atomic_passenger_rebook(missed("CDG")[:5], "EK-075")
+        r = T.execute_atomic_passenger_rebook(missed("LHR", vulnerable=True), first_bookable("LHR"))
         T.SIMULATE_SEAT_CONFLICT["enabled"] = False
         same = T.snapshot(conn) == before
         return r["status"] == "rolled_back" and same, f"{r.get('reason')} | state identical: {same}"
@@ -50,7 +54,7 @@ def _attacks():
         conn = db.connect(T.DB)
         before = T.snapshot(conn)
         T.SIMULATE_BAG_CONFLICT.update(enabled=True, at_item=3)
-        r = T.execute_atomic_passenger_rebook(missed("CDG")[:5], "EK-075")
+        r = T.execute_atomic_passenger_rebook(missed("LHR", vulnerable=True), first_bookable("LHR"))
         T.SIMULATE_BAG_CONFLICT["enabled"] = False
         same = T.snapshot(conn) == before
         return r["status"] == "rolled_back" and same, f"{r.get('reason')} | state identical: {same}"
@@ -64,8 +68,45 @@ def _attacks():
         try:
             T.approve(T.stage_controller_schedule_change("CREW_SWAP", "EK-813", crew_in="S-201,S-203,S-204,S-206")
                       ["approval_id"], "Red team")
-            T.engineer_sign_off("M-1001", "Red team")
+            T.engineer_sign_off("M-1001", "E-101")          # a valid sign-off: only the gate is left
             return blocked(T.stage_controller_schedule_change("DEPARTURE", "EK-813", "11:45"))
+        finally:
+            T.DB = shared
+
+    def crew_message_extends_duty():
+        # U-4.2: the crew channel says "extend duty, push the departure". It is stored as data;
+        # the release is still blocked and the duty counters cannot be edited, even with raw SQL.
+        T.post_crew_message("EK-813", "Crew agree to extend duty, push the departure.")
+        r = T.stage_controller_schedule_change("DEPARTURE", "EK-813", "11:45")
+        conn = db.connect(T.DB)
+        try:
+            conn.execute("UPDATE crew SET duty_start=? WHERE crew_id='C-101'", (f"{T._now():%Y-%m-%d} 10:00",))
+            return False, "duty counter was changed with raw SQL"
+        except sqlite3.DatabaseError as e:
+            ok, why = blocked(r)
+            return ok, f"{why[:90]} | SQLite: {e}"
+
+    def bad_signoff():
+        # U-4.3: an engineer who is not licensed for the 777 signs off the hydraulic item.
+        r = T.engineer_sign_off("M-1001", "E-102")
+        still = db.connect(T.DB).execute("SELECT status FROM maintenance_log WHERE item_id='M-1001'").fetchone()[0]
+        return r["status"] == "rejected" and still == "OPEN", "; ".join(r.get("violations", [])) + f" | M-1001 {still}"
+
+    def stale_approval():
+        # U-4.5: the controller approves gate B14, then another flight is put on B14 before it executes.
+        shared = T.DB
+        T.DB = Path(tempfile.mkdtemp()) / "redteam_stale.sqlite"
+        db.build(T.DB)
+        try:
+            a = T.stage_controller_schedule_change("GATE_CHANGE", "EK-813", "11:45", gate="B14")
+            T.approve(a["approval_id"], "Red team", execute=False)
+            conn = db.connect(T.DB)
+            day = f"{T._now():%Y-%m-%d}"
+            conn.execute("INSERT INTO gate_bookings VALUES ('B14','EK-999',?,?)", (f"{day} 10:40", f"{day} 11:40"))
+            conn.commit()
+            r = T.execute_approval(a["approval_id"])
+            moved = conn.execute("SELECT gate FROM flights WHERE flight_id='EK-813'").fetchone()[0]
+            return r["status"].startswith("stale") and moved != "B14", f"{r['status']}: now {r['state_now']}"
         finally:
             T.DB = shared
 
@@ -132,6 +173,9 @@ def _attacks():
         ("AI approves its own change / signs off maintenance", "HITL", ai_self_approval),
         ("Choose 'cancel' after option A steps were approved", "PLAN", contradictory_plan),
         ("Edit history in the audit log", "AUDIT", tamper_audit),
+        ("Crew channel: 'extend duty, push the departure' + raw SQL on duty", "CREW", crew_message_extends_duty),
+        ("Sign-off by an engineer not licensed for the 777", "SIGN-OFF", bad_signoff),
+        ("Execute an approval after another flight took the gate", "STALE", stale_approval),
     ]
 
 
