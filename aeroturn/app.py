@@ -291,7 +291,11 @@ SCENARIOS = {
 def act_build_scenario():
     T.reset(delay_min=ss.wi_delay, crew_duty_left_min=ss.wi_crew, maintenance_open=ss.wi_maint,
             seats_factor=ss.wi_seats, second_disruption=ss.wi_second)
+<<<<<<< Updated upstream
     T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = False
+=======
+    T.SIMULATE_SEAT_CONFLICT["enabled"] = False
+>>>>>>> Stashed changes
     ss.timeline, ss.brief, ss.models, ss.redteam = [], None, [], None
     ss.pop("inbound", None)            # start on the first late flight of the new scenario
     add_step("👤 HUMAN", "What-if scenario built", "sent",
@@ -359,8 +363,12 @@ with left:
         st.toggle("Add a second late flight (EK-433 from Singapore)", key="wi_second",
                   help="A different case at the same time: legal crew, free gate, no maintenance - only a short "
                        "delay is needed.")
+<<<<<<< Updated upstream
         st.button("🔁 Build this scenario", on_click=act_build_scenario, width="stretch", type="secondary",
                   disabled=BUSY, help=BUSY_HELP if BUSY else None)
+=======
+        st.button("🔁 Build this scenario", on_click=act_build_scenario, width="stretch", type="secondary")
+>>>>>>> Stashed changes
         st.caption("Rebuilds the database. Rules, critical path, costs and the AI all adapt; nothing is hard-coded.")
         if len(late) > 1:   # only a what-if scenario has more than one late flight: choose which one to work on
             st.selectbox("Work on disruption", late_ids, key="inbound",
