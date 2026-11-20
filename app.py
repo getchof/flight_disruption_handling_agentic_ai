@@ -59,6 +59,10 @@ st.markdown("""
   .track .ok { border-color:#2ecc71; } .track .wait { border-color:#f5a623; } .track .bad { border-color:#e74c3c; }
   .legend { color:#8fa3bf; font-size:.78rem; margin:0 0 12px; }
   .sec { color:#f5a623; font-size:.78rem; font-weight:700; letter-spacing:.04em; margin-top:10px; }
+  .st-key-run_agent button { min-height:3.4rem; font-size:1.2rem !important; font-weight:700;
+                             border-radius:12px; box-shadow:0 0 0 2px #f5a62366; }
+  .st-key-run_agent button p { font-size:1.2rem !important; font-weight:700; }
+  @keyframes runglow { 0%,100% { box-shadow:0 0 0 2px #f5a62366; } 50% { box-shadow:0 0 0 7px #f5a62333; } }
 </style>""", unsafe_allow_html=True)
 
 ss = st.session_state
@@ -368,12 +372,12 @@ def guide(s, f, flight):
         nxt = f"👤 Approve <b>#{pending[0]['approval_id']} · {esc(title)}</b> in the approval queue on the right."
     elif not rebooked and crew_ok is False and not ss.timeline:
         nxt = (f"Start here: press <b>🛫 Propose {fid} departure</b> (section 2) and watch code block it. "
-               f"Then press <b>▶ Run AeroTurn agent</b> (section 1) to let the AI plan the recovery.")
+               f"Then press <b>▶ Run AeroTurn agent</b> (the big orange button on the right) to let the AI plan the recovery.")
     elif not crew_ok or not gate_ok or (waiting and seats_left):
         rebook = f"rebooks the {waiting} waiting passengers (vulnerable first)" if waiting and seats_left else ""
         propose = " and ".join((["a legal standby crew"] if not crew_ok else []) + (["a free gate"] if not gate_ok else []))
         what = " and ".join(x for x in (rebook, f"proposes {propose} for you to approve" if propose else "") if x)
-        nxt = f"Press <b>▶ Run AeroTurn agent</b> (section 1): the AI {what}."
+        nxt = f"Press <b>▶ Run AeroTurn agent</b> (the big orange button on the right): the AI {what}."
     elif items:
         nxt = f"🔧 Press <b>Engineer signs off {', '.join(items)}</b> (section 2): only a licensed engineer can clear the inspection."
     else:
@@ -523,15 +527,17 @@ duty_l, duty_r = st.columns([6, 1], vertical_alignment="center")
 duty_l.markdown(f"<span class='chip c-purple' style='font-size:.9rem'>👤 On duty: {esc(ss.controller or '—')}</span>"
                 f"<span class='muted'> every approval is recorded under this name</span>", unsafe_allow_html=True)
 duty_r.button("change", on_click=act_change_duty, width="stretch", help="Hand over to another controller")
-guide_box = st.empty()       # next-step bar + recovery tracker (filled in draw_status)
-kpi_box = st.empty()
-left, center, right = st.columns([1.05, 2.1, 1.35], gap="medium")
-
-# ---------- Left: controls ----------
-with left:
-    # ---- 1. The AI ----
-    st.markdown("<div class='sec'>1 · LET THE AI PLAN</div>", unsafe_allow_html=True)
-    run = st.button("▶ Run AeroTurn agent", type="primary", width="stretch", disabled=BUSY,
+# ---------- Top action row: what to do next (left) + the AI's Run button (right), visible without scrolling ----------
+next_col, run_col = st.columns([3.3, 1], gap="medium")
+with next_col:
+    guide_box = st.empty()   # next-step bar + recovery tracker (filled in draw_status)
+with run_col:
+    st.markdown("<div class='sec' style='margin-top:0'>1 · LET THE AI PLAN</div>", unsafe_allow_html=True)
+    if not BUSY and not ss.run:    # nothing has run yet: gently pulse the button so it's the first thing seen
+        st.markdown("<style>@media (prefers-reduced-motion: no-preference) {"
+                    ".st-key-run_agent button { animation: runglow 1.8s ease-in-out infinite; } }</style>",
+                    unsafe_allow_html=True)
+    run = st.button("▶ Run AeroTurn agent", key="run_agent", type="primary", width="stretch", disabled=BUSY,
                     help="The agent is already running" if BUSY else
                          "The AI reads the situation and proposes the recovery. It can take 1-2 minutes.")
     conflict = st.toggle("💥 Simulate mid-way seat conflict", value=True,
@@ -539,8 +545,12 @@ with left:
                               "code rolls the whole batch back and the AI retries. Turn off for a clean run.")
     if BUSY or (ss.run and not ss.run["collected"]):
         st.fragment(agent_run_status, run_every=2)()
+kpi_box = st.empty()
+left, center, right = st.columns([1.05, 2.1, 1.35], gap="medium")
 
-    # ---- 2. The human ----
+# ---------- Left: controls ----------
+with left:
+    # ---- 2. The human (1 · the AI's Run button is at the top, next to the Next step bar) ----
     st.markdown("<div class='sec'>2 · YOUR DECISIONS</div>", unsafe_allow_html=True)
     st.caption(f"You are on duty as **{ss.controller or '—'}**. Approve or reject the AI's proposals in the "
                f"queue on the right →")
