@@ -67,7 +67,7 @@ ss.setdefault("brief", None)
 ss.setdefault("models", [])
 ss.setdefault("flash", None)      # one-off message after a button
 ss.setdefault("run", None)        # the agent run in the background thread (see start_agent_run)
-ss.setdefault("controller", "Demo controller")   # pre-filled so Approve works at once; editable in section 2
+ss.setdefault("controller", "")   # asked once at the start ("Who's on duty?"); shown at the top with "change"
 
 CITY = {"MAN": "Manchester", "BOM": "Mumbai", "LHR": "London", "JFK": "New York", "CDG": "Paris", "HKG": "Hong Kong",
         "SYD": "Sydney", "HAM": "Hamburg", "DOH": "Doha", "BKK": "Bangkok", "SIN": "Singapore", "DXB": "Dubai"}
@@ -228,7 +228,7 @@ BUSY_HELP = "Disabled while the agent is running (it would change the data under
 # ---------- Human / demo actions (buttons) ----------
 def act_approve(aid):
     if not ss.get("controller"):
-        ss.flash = ("error", "Enter the Operations Controller name first.")
+        ss.flash = ("error", "Set who's on duty first: press 'change' next to 👤 On duty at the top.")
         return
     r = T.approve(aid, ss.controller)
     status = r["status"]
@@ -240,7 +240,7 @@ def act_approve(aid):
 
 def act_reject(aid):
     if not ss.get("controller"):
-        ss.flash = ("error", "Enter the Operations Controller name first.")
+        ss.flash = ("error", "Set who's on duty first: press 'change' next to 👤 On duty at the top.")
         return
     T.reject(aid, ss.controller, "rejected in console")
     add_step("👤 HUMAN", f"Controller rejected #{aid}", "blocked", f"Rejected by {ss.controller}. Nothing changed.")
@@ -436,6 +436,32 @@ st.markdown(flat(f"""<div class="banner"><h1>✈️ AeroTurn · Operations Contr
 <span class="chip c-blue">🤖 AI plans</span><span class="chip c-green">⚙️ Code enforces</span>
 <span class="chip c-purple">👤 Human approves</span></div>"""), unsafe_allow_html=True)
 
+# ---------- Who's on duty? Asked once; every approval is logged under this name ----------
+def _duty_form():
+    st.markdown("You are the **Operations Controller**: the AI proposes, **you approve or reject**. "
+                "Your name is recorded in the audit log next to every decision you make.")
+    name = st.text_input("Your name", value=ss.controller, placeholder="e.g. Controller J. Haddad", max_chars=40)
+    if st.button("Start", type="primary", width="stretch"):
+        if not name.strip():
+            st.error("Type your name first.")
+        else:
+            ss.controller = name.strip()
+            st.rerun()
+
+
+first_visit_dialog = st.dialog("👤 Who's on duty?", dismissible=False)(_duty_form)   # can't be skipped
+change_dialog = st.dialog("👤 Change who's on duty")(_duty_form)                    # can be closed
+
+
+def act_change_duty():
+    ss.change_duty = True
+
+
+if not ss.controller:
+    first_visit_dialog()
+elif ss.pop("change_duty", False):
+    change_dialog()
+
 with st.expander("ℹ️ What's going on? (read this first)", expanded=not ss.timeline):
     st.markdown(f"A plane (**{esc(D['inbound'])}** from {CITY.get(D['route'][:3], D['route'][:3])}) landed "
                 f"**{D['delay_min']} minutes late** at Dubai. The same plane must fly **{esc(OUT)}** next. Its crew has "
@@ -448,6 +474,10 @@ if ss.flash:
     getattr(st, ss.flash[0])(ss.flash[1])
     ss.flash = None
 
+duty_l, duty_r = st.columns([6, 1], vertical_alignment="center")
+duty_l.markdown(f"<span class='chip c-purple' style='font-size:.9rem'>👤 On duty: {esc(ss.controller or '—')}</span>"
+                f"<span class='muted'> every approval is recorded under this name</span>", unsafe_allow_html=True)
+duty_r.button("change", on_click=act_change_duty, width="stretch", help="Hand over to another controller")
 guide_box = st.empty()       # next-step bar + recovery tracker (filled in draw_status)
 kpi_box = st.empty()
 left, center, right = st.columns([1.05, 2.1, 1.35], gap="medium")
@@ -467,9 +497,8 @@ with left:
 
     # ---- 2. The human ----
     st.markdown("<div class='sec'>2 · YOUR DECISIONS</div>", unsafe_allow_html=True)
-    st.text_input("Your name (Operations Controller)", key="controller",
-                  help="Every approval is recorded under this name in the audit log.")
-    st.caption("Approve or reject the AI's proposals in the queue on the right →")
+    st.caption(f"You are on duty as **{ss.controller or '—'}**. Approve or reject the AI's proposals in the "
+               f"queue on the right →")
     items = open_items(S0)
     st.button(f"🔧 Engineer signs off {', '.join(items) or 'maintenance'}", on_click=act_signoff, args=(items,),
               disabled=not items, width="stretch",
@@ -691,7 +720,7 @@ draw_brief()
 # =====================================================================
 def act_select_plan(flight_id, option_id):
     if not ss.get("controller"):
-        ss.flash = ("error", "Enter the Operations Controller name first.")
+        ss.flash = ("error", "Set who's on duty first: press 'change' next to 👤 On duty at the top.")
         return
     r = costs.select_recovery_plan(flight_id, option_id, ss.controller)
     if r["status"] == "refused":
