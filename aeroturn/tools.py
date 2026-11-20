@@ -460,6 +460,19 @@ def approved_changes(conn, flight_id):
     return [f"#{r['approval_id']} {r['kind']}" for r in rows if json.loads(r["payload"])["flight_id"] == flight_id]
 
 
+def _gate_violations(conn, flight, dep):
+    """The gate the flight WILL use must fit it and be free until `dep`. A pending gate change counts
+    (the controller must approve it first; approve() enforces that order)."""
+    gate_id = flight["gate"]
+    pending_gate = _pending_gate_change(conn, flight["flight_id"])
+    if pending_gate:
+        gate_id = pending_gate["gate"]
+    row = conn.execute("SELECT * FROM gates WHERE gate_id=?", (gate_id,)).fetchone()
+    gate = dict(row) if row else {"gate_id": gate_id, "wide_body": 1}
+    return [x + ("" if pending_gate else " (stage a GATE_CHANGE first)") for x in
+            g.check_gate(gate, flight["body"], _now(), dep, _gate_bookings(conn, gate_id, except_flight=flight["flight_id"]))]
+
+
 def _check_change(conn, kind, flight_id, new_time, gate, crew_in):
     """Run the guards for a proposed change. Used when staging AND again on approval."""
     flight = _flight(conn, flight_id)
@@ -475,24 +488,22 @@ def _check_change(conn, kind, flight_id, new_time, gate, crew_in):
         return [f"PLAN: the controller chose option {plan} for {flight_id}; a {kind} belongs to option A and "
                 f"would contradict that decision"], dep
 
+    # A released flight is final: no further schedule, gate, crew or departure change (and no second release).
+    if flight["status"] == "RELEASED":
+        return [f"RELEASED: {flight_id} has already been released for departure at {flight['est_dep'][-5:]}; "
+                f"no further {kind} is possible"], dep
+
     if kind == "DEPARTURE":
+        # The aircraft must also have a gate until it leaves: a departure later than the gate booking
+        # would put it on a gate another flight has.
         return g.check_departure(_crew_on(conn, flight_id), _maintenance(conn, flight["aircraft_reg"]),
-                                 dep, arrival, flight["block_min"], _now()), dep
+                                 dep, arrival, flight["block_min"], _now()) + _gate_violations(conn, flight, dep), dep
     if kind == "DELAY":
         v = []
         if dep < _earliest_departure(conn, flight):
             v.append(f"TURNAROUND: {dep:%H:%M} is before the earliest legal departure "
                      f"{_earliest_departure(conn, flight):%H:%M}")
-        # Check the gate the flight WILL use: a pending gate change counts (the controller
-        # must approve it first; approve() enforces that order).
-        gate_id = flight["gate"]
-        pending_gate = _pending_gate_change(conn, flight_id)
-        if pending_gate:
-            gate_id = pending_gate["gate"]
-        row = conn.execute("SELECT * FROM gates WHERE gate_id=?", (gate_id,)).fetchone()
-        v += [x + ("" if pending_gate else " (stage a GATE_CHANGE first)") for x in
-              g.check_gate(dict(row), flight["body"], _now(), dep, _gate_bookings(conn, gate_id, except_flight=flight_id))]
-        return v, dep
+        return v + _gate_violations(conn, flight, dep), dep
     if kind == "GATE_CHANGE":
         row = conn.execute("SELECT * FROM gates WHERE gate_id=?", (gate,)).fetchone()
         if not row:
@@ -675,9 +686,9 @@ def approve(approval_id, controller):
     if not row or row["status"] != "PENDING":
         return {"status": "error", "message": f"Approval #{approval_id} is not pending"}
     req = json.loads(row["payload"])
-    if req["kind"] == "DELAY":
+    if req["kind"] in ("DELAY", "DEPARTURE"):
         gate_first = _pending_gate_change(conn, req["flight_id"])
-        if gate_first:   # order matters: the flight must be at its new gate before it can be delayed
+        if gate_first:   # order matters: the flight must be at its new gate before it is delayed or released
             return {"status": "waiting", "message": f"Approve gate change #{gate_first['approval_id']} first"}
     held = {}
 
@@ -707,7 +718,11 @@ def approve(approval_id, controller):
                 tx.execute("UPDATE crew SET assigned_flight=?, status='ASSIGNED', duty_start=? WHERE crew_id=?",
                            (fid, _ts(), cid))
         elif req["kind"] == "DEPARTURE":
-            tx.execute("UPDATE flights SET est_dep=?, status='RELEASED' WHERE flight_id=?", (new, fid))
+            f = _flight(tx, fid)
+            shift = dep - db.to_time(f["est_dep"])
+            tx.execute("UPDATE flights SET est_dep=?, est_arr=?, status='RELEASED' WHERE flight_id=?",
+                       (new, (db.to_time(f["est_arr"]) + shift).strftime(db.TIME_FMT), fid))
+            tx.execute('UPDATE gate_bookings SET "end"=? WHERE flight_id=?', (new, fid))   # the gate is held until departure
         tx.execute("UPDATE pending_approvals SET status='APPROVED', decided_by=?, decided_at=? WHERE approval_id=?",
                    (controller, _ts(), approval_id))
         return {"status": "approved", "change": req, "summary": f"approved by {controller}"}

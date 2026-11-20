@@ -36,7 +36,7 @@ python -m streamlit run app.py                       # console at http://localho
 4. **(15 s) Atomic rollback.** Click **💥 Rebook batch with seat conflict** → purple ROLLED BACK, *"seats & bags identical to before: YES"*, double bookings 0, orphan bags 0. Optional: **🧳 Rebook batch with bag-transfer failure** → the integrity check catches the orphaned bag and rolls back too.
 5. **(15 s) Human approval.** Type the controller name → approve crew swap, **gate change B12→B14**, delay; engineer signs off; propose departure → now passes → approve → RELEASED.
 6. **(10 s) Decision support.** Tab 💶: code-priced options — A €1,500 vs B €403,750 vs C €450,250; AI recommends A, controller clicks *Choose*.
-7. **(10 s) Proof.** Tab 🛡️ → **18/18 attacks stopped**; tab 🔗 → simulate insider edit → *TAMPERING DETECTED*. Pick **Injection attack** and Run → blocked by the input filter (regex, plus the Prompt Guard model when online) before any AI sees it.
+7. **(10 s) Proof.** Tab 🛡️ → **19/19 attacks stopped**; tab 🔗 → simulate insider edit → *TAMPERING DETECTED*. Pick **Injection attack** and Run → blocked by the input filter (regex, plus the Prompt Guard model when online) before any AI sees it.
 
 8. **(bonus) What-if.** Open **🔮 What-if scenario builder** → *Long delay +150 min* → Build: 115 connections now break (Mumbai too), departure moves to 13:00, costs change. Or let a judge pick the delay.
 

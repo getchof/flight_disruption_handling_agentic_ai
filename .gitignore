@@ -10,3 +10,9 @@ __pycache__/
 *.pyc
 .venv/
 .streamlit/secrets.toml
+
+# Local tools and personal notes (kept on the laptop, not in the repo)
+CLAUDE.md
+.claude/
+.agents/
+PITCH_PREP.md
