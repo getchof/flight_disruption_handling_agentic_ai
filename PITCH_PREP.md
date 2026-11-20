@@ -12,7 +12,7 @@
 - **Problem:** a late plane at Dubai causes four problems at once — passengers miss connections, the crew is about to exceed legal duty hours, a mandatory inspection is open, and the gate is double-booked.
 - **Risk of a plain AI agent:** it could rebook halfway and fail (double bookings, lost bags) or bend safety rules to save time.
 - **Our design:** the AI chooses actions; **code** enforces every rule and makes every change in all-or-nothing transactions; a **human controller** approves every schedule, gate and crew change.
-- **Result in the demo:** 38 passengers rebooked, **10/10 vulnerable protected**, 0 double bookings, 0 orphan bags, departure **11:45**, cheapest option **€1,500** vs **€450,250** to cancel, **18/18** attacks blocked.
+- **Result in the demo:** 38 passengers rebooked, **10/10 vulnerable protected**, 0 double bookings, 0 orphan bags, departure **11:45**, cheapest option **€1,500** vs **€450,250** to cancel, **19/19** attacks blocked.
 
 ---
 
@@ -175,8 +175,8 @@ db.py ──────────── SQLite schema, scenario seed, integri
 |---|---|---|
 | `test_guards.py` | 21 | every rule and DB check |
 | `test_tools.py` | 30 | rebooking, rollback (seat + bag), approvals, notifications, options, stop switch, any flight |
-| `test_whatif.py` | 10 | other delays, crew, maintenance, seat supply |
-| `redteam.py` | 18 attacks | all blocked |
+| `test_whatif.py` | 11 | other delays, crew, maintenance, seat supply |
+| `redteam.py` | 19 attacks | all blocked |
 
 ---
 
@@ -215,7 +215,7 @@ db.py ──────────── SQLite schema, scenario seed, integri
 | 5 Approve (30 s) | ✅ #1 CREW_SWAP → ✅ #2 GATE_CHANGE B14 → ✅ #3 DELAY 11:45 | Green cards; crew LEGAL; gate B14 | "Rules are re-checked at approval." |
 | 6 Release (20 s) | **🔧 Engineer signs off M-1001** → **🛫 Propose departure** → ✅ #4 | EK-813 **RELEASED 11:45** | "Same request as step 2 — now everything passes." |
 | 7 Options (20 s) | 💶 tab → **Choose option A** | A €1,500 vs B/C €400k+; ✓ Option A chosen | "Code prices, the AI recommends in its brief, and the decision is mine." |
-| 8 Proof (20 s) | 🛡️ → run suite; 🔗 → simulate insider edit → Verify | **18/18**; **TAMPERING DETECTED** | "Attacked 18 ways, all blocked; history can't be rewritten." |
+| 8 Proof (20 s) | 🛡️ → run suite; 🔗 → simulate insider edit → Verify | **19/19**; **TAMPERING DETECTED** | "Attacked 19 ways, all blocked; history can't be rewritten." |
 
 **Optional:** Input → **Injection attack** → ▶ Run → red *Input safety filter BLOCKED* in a second, no AI called.
 
@@ -236,14 +236,14 @@ db.py ──────────── SQLite schema, scenario seed, integri
 **Close.** *"AeroTurn doesn't ask you to trust the AI. It lets the AI do what it's good at and makes it impossible for it to do what it shouldn't. AI plans. Code enforces. Humans approve."*
 
 ### 30-second version
-*"When a late plane threatens connections, crew limits and maintenance at once, controllers need speed — but an AI agent alone could double-book passengers or fly a tired crew. AeroTurn lets the AI plan while code enforces every safety rule: crew duty and maintenance as frozen Python constraints, rebookings in all-or-nothing transactions, vulnerable passengers first. Every schedule, gate and crew change waits for a human. In our demo: 38 rebooked, 10 of 10 vulnerable protected, departure at 11:45 instead of a €450,000 cancellation, and 18 of 18 attacks blocked."*
+*"When a late plane threatens connections, crew limits and maintenance at once, controllers need speed — but an AI agent alone could double-book passengers or fly a tired crew. AeroTurn lets the AI plan while code enforces every safety rule: crew duty and maintenance as frozen Python constraints, rebookings in all-or-nothing transactions, vulnerable passengers first. Every schedule, gate and crew change waits for a human. In our demo: 38 rebooked, 10 of 10 vulnerable protected, departure at 11:45 instead of a €450,000 cancellation, and 19 of 19 attacks blocked."*
 
 ---
 
 ## 11. Judge questions and answers
 
 **Can the AI break a rule?**
-No. Rules live in `guards.py`, outside the AI, frozen, and checked again when a human approves. The AI has no approve, reject, sign-off or choose-option tool. The red team proves it (18/18).
+No. Rules live in `guards.py`, outside the AI, frozen, and checked again when a human approves. The AI has no approve, reject, sign-off or choose-option tool. The red team proves it (19/19).
 
 **What if a rebooking fails halfway?**
 One write gateway: `BEGIN` → apply → integrity check → `COMMIT` or `ROLLBACK`. Plus the database's own `UNIQUE` index refuses a second seat even for raw SQL. Demo: the seat-conflict and bag-failure buttons.
@@ -337,6 +337,6 @@ Synthetic data, fixed scenario clock, single hub, indicative compensation, disru
 - Result: **38** rebooked · **7** transfer desk · **10/10** vulnerable · **0** double bookings · **0** orphan bags
 - Options: A **€1,500** · B **€403,750** · C **€450,250** · D **€5,500** · E **€442,000** · F **€1,500**
 - Saved by rebooking connecting passengers: **€8,100**
-- Red team **18/18** · tests **30 + 21 + 10** · **18** AI providers in the fallback chain
+- Red team **19/19** · tests **30 + 21 + 11** · **18** AI providers in the fallback chain
 
 **Last line:** *"AI plans. Code enforces. Humans approve."*

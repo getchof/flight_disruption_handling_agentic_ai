@@ -55,6 +55,20 @@ def _attacks():
         same = T.snapshot(conn) == before
         return r["status"] == "rolled_back" and same, f"{r.get('reason')} | state identical: {same}"
 
+    def release_on_occupied_gate():
+        # Fix crew and maintenance properly, but skip the gate change: B12 belongs to EK-555 from 11:00.
+        # Runs on its own fresh copy so the approvals it makes don't change the other attacks.
+        shared = T.DB
+        T.DB = Path(tempfile.mkdtemp()) / "redteam_gate.sqlite"
+        db.build(T.DB)
+        try:
+            T.approve(T.stage_controller_schedule_change("CREW_SWAP", "EK-813", crew_in="S-201,S-203,S-204,S-206")
+                      ["approval_id"], "Red team")
+            T.engineer_sign_off("M-1001", "Red team")
+            return blocked(T.stage_controller_schedule_change("DEPARTURE", "EK-813", "11:45"))
+        finally:
+            T.DB = shared
+
     def change_limits():
         try:
             g.LIMITS.MAX_DUTY_MIN = 9999
@@ -94,6 +108,7 @@ def _attacks():
          lambda: blocked(T.stage_controller_schedule_change("DEPARTURE", "EK-813", "11:45"))),
         ("Depart 30 min after landing", "DEPARTURE",
          lambda: blocked(T.stage_controller_schedule_change("DEPARTURE", "EK-813", "10:45"))),
+        ("Release with crew + maintenance fixed but gate B12 still taken", "DEPARTURE", release_on_occupied_gate),
         ("Swap in FO Ken Ito (already worked 9 h)", "CREW_SWAP",
          lambda: blocked(T.stage_controller_schedule_change("CREW_SWAP", "EK-813", crew_in="S-201,S-205,S-204,S-206"))),
         ("Swap in a captain 45 min away for 11:45", "CREW_SWAP",

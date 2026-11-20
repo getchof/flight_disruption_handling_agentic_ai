@@ -23,7 +23,7 @@ database directly and never approves anything. Every change goes through one wri
 | 7b | Risky → human | Departure release, delay, crew swap, gate change → `pending_approvals` → controller Approve/Reject; engineer sign-off | `tools.py`, `app.py` | Human |
 | 8 | One write gateway | `write_gateway()`: re-check guards → `BEGIN IMMEDIATE` → apply → integrity check → `COMMIT` or `ROLLBACK` → audit | `tools.py` | Code |
 | 9 | Log & report | SHA-256 hash-chained audit log (AI / CODE / HUMAN actor on every row) + AI executive brief beside code-verified facts | `db.py`, `agent.py` | Code + AI |
-| 10 | Demo | OCC console, red-team scorecard (17/17), critical-path Gantt, recovery options | `app.py`, `redteam.py` | You |
+| 10 | Demo | OCC console, red-team scorecard (19/19), critical-path Gantt, recovery options | `app.py`, `redteam.py` | You |
 
 ### Tech stack
 - **Python 3.11+**, **SQLite** (stdlib), **Streamlit** console. Backend = Python modules imported in-process (no web server needed).

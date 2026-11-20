@@ -61,6 +61,27 @@ def test_departure_guard_uses_the_scenario_clock():
     assert late["status"] == "blocked" and "CREW DUTY" in late["violations"][0]
 
 
+def test_release_needs_a_free_gate_and_happens_once():
+    """Found in the console: with a rested crew and the inspection signed off, EK-813 was released at
+    11:45 from gate B12 although EK-555 holds B12 from 11:00, and a second DEPARTURE could be queued."""
+    build(crew_duty_left_min=600, maintenance_open=False)       # crew legal, M-1001 done, gate still B12
+    r = T.stage_controller_schedule_change("DEPARTURE", "EK-813", "11:45")
+    assert r["status"] == "blocked" and any("GATE: B12 is used by EK-555" in v for v in r["violations"]), r
+    gate = T.stage_controller_schedule_change("GATE_CHANGE", "EK-813", "11:45", gate="B14")
+    dep = T.stage_controller_schedule_change("DEPARTURE", "EK-813", "11:45")   # pending gate change counts
+    assert dep["status"] == "pending_controller_approval", dep
+    assert T.approve(dep["approval_id"], "Controller Jane")["status"] == "waiting", "gate change must come first"
+    assert T.approve(gate["approval_id"], "Controller Jane")["status"] == "approved"
+    assert T.approve(dep["approval_id"], "Controller Jane")["status"] == "approved"
+    conn = db.connect(T.DB)
+    assert conn.execute("SELECT status, gate FROM flights WHERE flight_id='EK-813'").fetchone()[:] == ("RELEASED", "B14")
+    assert conn.execute('SELECT "end" FROM gate_bookings WHERE flight_id=\'EK-813\'').fetchone()[0].endswith("11:45")
+    for kind, kw in [("DEPARTURE", {"new_time": "11:45"}), ("DELAY", {"new_time": "12:00"}),
+                     ("GATE_CHANGE", {"new_time": "11:45", "gate": "A3"})]:
+        again = T.stage_controller_schedule_change(kind, "EK-813", **kw)
+        assert again["status"] == "blocked" and "already been released" in again["violations"][0], (kind, again)
+
+
 def test_maintenance_setting():
     build(maintenance_open=False)
     assert T.verified_facts()["open_mandatory_maintenance"] == []
