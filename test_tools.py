@@ -218,7 +218,7 @@ def test_cannot_choose_b_after_option_a_steps_are_approved():
     T.approve(gate["approval_id"], "Controller Jane")
     r = costs.select_recovery_plan("EK-813", "B", "Controller Jane")
     assert r["status"] == "refused" and "#1 GATE_CHANGE" in r["reason"], r
-    assert T.chosen_plan(conn, "EK-813") is None
+    assert T.chosen_plan(conn, "EK-813") == "A", "approving an option A step records A as the choice"
 
 
 def test_choosing_c_rejects_pending_a_steps_and_locks_new_ones():
@@ -323,6 +323,40 @@ def test_realistic_extra_recovery_options():
     reordered = sorted(r["options"], key=lambda o: o["id"] != "F")       # F first: A must still win
     best = min((o for o in reordered if o["feasible"]), key=lambda o: (o["total_eur"], o["delay_min"]))
     assert best["id"] == "A"
+
+
+def test_approving_an_option_a_step_records_a_as_the_choice():
+    """Found in the console: crew, gate and delay of option A were approved but no plan was 'chosen'."""
+    conn = fresh()
+    sel = lambda: conn.execute("SELECT actor, detail, outcome FROM audit_log WHERE action='recovery_plan_selected' "
+                               "ORDER BY id").fetchall()
+    swap = T.stage_controller_schedule_change("CREW_SWAP", "EK-813", crew_in="S-201,S-203,S-204,S-206")
+    assert T.chosen_plan(conn, "EK-813") is None, "staging alone is not a decision"
+    r = T.approve(swap["approval_id"], "Controller Jane")
+    assert r["status"] == "approved" and r["plan_chosen"] == "A", r
+    rows = sel()
+    assert len(rows) == 1 and rows[0][0] == "HUMAN" and "Controller Jane" in rows[0][2], rows
+    gate = T.stage_controller_schedule_change("GATE_CHANGE", "EK-813", "11:45", gate="B14")
+    assert "plan_chosen" not in T.approve(gate["approval_id"], "Controller Jane") and len(sel()) == 1, \
+        "recorded once, not on every step"
+    assert db.verify_audit_chain(conn)["ok"]
+
+
+def test_an_explicit_choice_is_never_overridden():
+    import costs
+    conn = fresh()
+    costs.select_recovery_plan("EK-813", "D", "Controller Jane")          # aircraft swap also uses a crew swap
+    swap = T.stage_controller_schedule_change("CREW_SWAP", "EK-813", crew_in="S-201,S-203,S-204,S-206")
+    assert "plan_chosen" not in T.approve(swap["approval_id"], "Controller Jane")
+    assert T.chosen_plan(conn, "EK-813") == "D"
+
+
+def test_cancel_with_rebooking_e_locks_option_a_steps():
+    import costs
+    fresh()
+    costs.select_recovery_plan("EK-813", "E", "Controller Jane")
+    r = T.stage_controller_schedule_change("GATE_CHANGE", "EK-813", "11:45", gate="B14")
+    assert r["status"] == "blocked" and "option E" in r["violations"][0], r
 
 
 def test_choosing_the_same_option_twice_records_it_once():

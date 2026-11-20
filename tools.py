@@ -482,9 +482,9 @@ def _check_change(conn, kind, flight_id, new_time, gate, crew_in):
     arrival = _inbound_arrival(conn, flight)
 
     # Plan consistency: crew swap / gate / delay / departure belong to option A. If the controller
-    # chose option B (wait for crew rest) or C (cancel), these changes would contradict that decision.
+    # chose option B (wait for crew rest), C or E (cancel), these changes would contradict that decision.
     plan = chosen_plan(conn, flight_id)
-    if plan in ("B", "C"):
+    if plan in ("B", "C", "E"):
         return [f"PLAN: the controller chose option {plan} for {flight_id}; a {kind} belongs to option A and "
                 f"would contradict that decision"], dep
 
@@ -731,6 +731,13 @@ def approve(approval_id, controller):
     if result["status"] == "blocked":
         _set_approval_status(approval_id, "REFUSED_BY_GUARD", controller, "refused by guard re-check")
         return {"status": "refused_by_guard", "violations": result["violations"]}
+    # Approving a crew swap / gate change / delay / release carries out option A. If the controller has
+    # not chosen a plan yet, that approval IS the choice: record it, under the same name, so the plan and
+    # what really happened never disagree.
+    if result["status"] == "approved" and chosen_plan(conn, req["flight_id"]) is None:
+        audit(conn, "HUMAN", "recovery_plan_selected", {"flight_id": req["flight_id"], "option": "A"},
+              f"chosen by {controller} (approved option A step #{approval_id}: {req['kind']})")
+        result["plan_chosen"] = "A"
     return result
 
 

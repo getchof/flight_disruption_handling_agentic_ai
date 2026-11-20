@@ -235,6 +235,11 @@ def act_approve(aid):
     detail = (f"Approval #{aid} approved by {ss.controller}" if status == "approved" else
               r.get("message") or " · ".join(r.get("violations", [])))
     add_step("👤 HUMAN → ⚙️ CODE re-check", f"Controller decision on #{aid}", status, detail)
+    if r.get("plan_chosen"):
+        add_step("👤 HUMAN", f"Recovery option {r['plan_chosen']} chosen", "approved",
+                 f"By approving its first step, {ss.controller} chose option {r['plan_chosen']} "
+                 f"(the other options are now locked)")
+        detail += f" · option {r['plan_chosen']} is now the chosen recovery plan"
     ss.flash = ("success" if status == "approved" else "warning", detail)
 
 
@@ -372,8 +377,10 @@ def guide(s, f, flight):
     elif items:
         nxt = f"🔧 Press <b>Engineer signs off {', '.join(items)}</b> (section 2): only a licensed engineer can clear the inspection."
     else:
-        nxt = (f"Press <b>🛫 Propose {fid} departure</b> (section 2): every rule should pass now. "
-               f"Then approve the release on the right.")
+        when = s["outbound"]["earliest_legal_departure"]
+        nxt = (f"✅ Every safety rule for {fid} now passes: crew legal · gate {flight['gate']} free · "
+               f"inspection signed off · {when} is the earliest legal departure. Press <b>🛫 Propose {fid} "
+               f"departure</b> (section 2) to release it at {when}, then approve the release in the queue on the right.")
     return track, nxt
 
 
