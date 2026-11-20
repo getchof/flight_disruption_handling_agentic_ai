@@ -303,6 +303,28 @@ def test_option_a_keeps_its_cost_while_being_executed():
     assert all(s.endswith("(approved)") for s in now["actions"] if not s.startswith("Engineer")), now["actions"]
 
 
+def test_realistic_extra_recovery_options():
+    """D aircraft swap, E cancel but rebook today where possible, F fallback crew further away."""
+    import costs
+    fresh()
+    opts = {o["id"]: o for o in costs.get_recovery_options("EK-813")["options"]}
+    assert set(opts) == {"A", "B", "C", "D", "E", "F"}, set(opts)
+    d, e, f = opts["D"], opts["E"], opts["F"]
+    # D: spare A6-EQS, no maintenance sign-off or gate change needed for EK-813, costs more than A
+    assert "A6-EQS" in d["title"] and d["blockers"] == [] and d["delay_min"] == 30
+    assert d["total_eur"] == costs.AIRCRAFT_SWAP_EUR + 4 * costs.STANDBY_CALLOUT_EUR
+    # E: 45 on EK-017 + 60 via the partner today, 205 tomorrow; cheaper than cancelling everyone (C)
+    assert "105 passengers today, 205 tomorrow" in e["title"] and e["total_eur"] < opts["C"]["total_eur"]
+    # F: next legal crew (Capt. Grace Lee from the hotel), later than A, never the 'lowest cost' over A
+    assert "Capt. Grace Lee" in f["title"] and f["delay_min"] > opts["A"]["delay_min"]
+    r = costs.get_recovery_options("EK-813")
+    # A and F both cost EUR 1,500: the tie is broken by the earlier departure (A 11:45 vs F 12:00), not list order
+    assert r["lowest_cost_feasible"] == "A" and r["lowest_cost_tied_with"] == ["F"], r["lowest_cost_tied_with"]
+    reordered = sorted(r["options"], key=lambda o: o["id"] != "F")       # F first: A must still win
+    best = min((o for o in reordered if o["feasible"]), key=lambda o: (o["total_eur"], o["delay_min"]))
+    assert best["id"] == "A"
+
+
 def test_choosing_the_same_option_twice_records_it_once():
     import costs
     conn = fresh()
@@ -422,7 +444,8 @@ def test_any_late_flight_not_just_ek812():
     todo = agent.remaining_work("EK-433")
     assert not any("CREW_SWAP" in x or "GATE_CHANGE" in x or "DELAY" in x for x in todo), todo
     opts = costs.get_recovery_options("EK-441")
-    assert [o["id"] for o in opts["options"]] == ["A", "C"], "no 'wait for crew rest' option when crew is legal"
+    ids = [o["id"] for o in opts["options"]]
+    assert "B" not in ids and "F" not in ids, f"crew is legal: no crew-rest or fallback-crew option ({ids})"
     assert "crew swap" not in opts["options"][0]["title"].lower()
 
 

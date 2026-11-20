@@ -17,6 +17,7 @@ from types import MappingProxyType
 import db
 import guards as g
 import tools as T
+import turnaround
 
 DISTANCE_KM = MappingProxyType({"LHR": 5500, "JFK": 11000, "CDG": 5250, "MAN": 5700, "BOM": 1930,
                                 "HKG": 5950, "SYD": 12040, "HAM": 4850, "DOH": 380})
@@ -29,6 +30,14 @@ CREW_REST_MIN = 12 * 60            # minimum rest before the inbound crew may fl
 PAX_LOAD = MappingProxyType({"EK-813": 310})
 RETURN_LEG = MappingProxyType({"EK-813": ("EK-814", 350)})
 DEFAULT_PAX_LOAD = 300
+
+# Operational data a real deployment reads from fleet and partner systems.
+# Option D: a serviceable spare aircraft parked at the hub (no flights today), ready after preparation.
+SPARE_AIRCRAFT = ({"reg": "A6-EQS", "type": "B777-300ER", "body": "WIDE", "stand": "B18", "prep_min": 45},)
+AIRCRAFT_SWAP_EUR = 4000           # towing, catering/fuel on the other aircraft, ground handling
+# Option E: seats a partner airline can offer today (arrival time at the destination, ticket cost).
+PARTNER_SEATS = MappingProxyType({"MAN": ({"via": "partner airline via London", "seats": 60, "arrives": "20:30",
+                                           "ticket_eur": 350},)})
 
 
 def distance_km(dest):
@@ -79,6 +88,33 @@ def passenger_recovery(inbound_flight):
     return {"affected": rebooked + unresolved, "rebooked_same_day": rebooked, "unresolved_overnight": unresolved,
             "cost_now_eur": now_cost, "cost_if_nobody_rebooked_eur": nothing_cost,
             "saved_by_rebooking_eur": nothing_cost - now_cost}
+
+
+def _backup_crew(conn, flight, match):
+    """Option F: for each role the matcher fills, the NEXT legal standby crew member (further away).
+    Returns (departure, team, names of the people who differ from the best team) or None."""
+    standby = [{**dict(r), "duty_start": db.to_time(r["duty_start"]) if r["duty_start"] else None}
+               for r in conn.execute("SELECT * FROM crew WHERE status='STANDBY' ORDER BY minutes_away, crew_id")]
+    floor = T._floor_departure(conn, flight)
+    team, changed = [], []
+    for pick in match["team"]:
+        legal = [s for s in standby if s["role"] == pick["role"]
+                 and not g.check_crew_legal([s], floor, flight["block_min"], T._now())]
+        others = [s for s in legal if s["crew_id"] != pick["crew_id"]]
+        chosen = others[0] if others else next(s for s in legal if s["crew_id"] == pick["crew_id"])
+        team.append(chosen)
+        if others:
+            changed.append(chosen["name"])
+    if not changed:
+        return None
+    kept = [c for c in T._crew_on(conn, flight["flight_id"]) if c["crew_id"] not in {p["replaces"] for p in match["team"]}]
+    minutes = max(c["minutes_away"] for c in team + kept)
+    signed = not g.check_maintenance(T._maintenance(conn, flight["aircraft_reg"]))
+    cpm = turnaround.plan(T._inbound_arrival(conn, flight), minutes, signed)["departure"]
+    dep = max(floor, cpm, db.to_time(flight["sched_dep"]))
+    if g.check_crew_legal(team + kept, dep, flight["block_min"], T._now()) or g.check_crew_reachable(team, dep, T._now()):
+        return None
+    return dep, team, changed
 
 
 def get_recovery_options(flight_id: str) -> dict:
@@ -175,11 +211,101 @@ def get_recovery_options(flight_id: str) -> dict:
         "blockers": [f"Aircraft {flight['aircraft_reg']} stays grounded until {', '.join(open_items)} is signed off "
                      f"(no departure today, so nothing blocks the cancellation itself)"] if open_items else []})
 
+    # D: aircraft swap - fly the outbound with a ready spare aircraft; the late aircraft stays for its inspection
+    spare = next((a for a in SPARE_AIRCRAFT if a["body"] == flight["body"]), None)
+    if spare and (open_items or not crew_ok or (dep_a and dep_a > sched)):
+        crew_ready = T._now() if crew_ok else (
+            db.to_time(f"{T._now():%Y-%m-%d} {match['team_ready_at']}") if match["team_ready_at"] else None)
+        if crew_ready:
+            boarding = timedelta(minutes=g.LIMITS.BOARDING_MIN)
+            dep_d = max(sched, T._now() + timedelta(minutes=spare["prep_min"]) + boarding, crew_ready + boarding)
+            delay_d = int((dep_d - sched).total_seconds() // 60)
+            options.append({
+                "id": "D", "title": f"Swap aircraft to spare {spare['reg']}" + ("" if crew_ok else " + standby crew") +
+                                    f", depart {dep_d:%H:%M}",
+                "actions": [f"AIRCRAFT SWAP: {flight_id} on {spare['reg']} ({spare['type']}, stand {spare['stand']})"] +
+                           ([] if crew_ok else [f"CREW_SWAP {match['recommended_crew_in']}"]) +
+                           ([f"DELAY to {dep_d:%H:%M}"] if delay_d > 0 else []),
+                "delay_min": delay_d,
+                "compensation_eur": pax * compensation(km, delay_d),
+                "care_eur": pax * care(delay_d),
+                "operational_eur": AIRCRAFT_SWAP_EUR + (0 if crew_ok else STANDBY_CALLOUT_EUR * len(match["team"])),
+                "knock_on": f"None: {ret_id} flies on {spare['reg']}; {flight['aircraft_reg']} stays for "
+                            f"{', '.join(open_items) or 'its turnaround'} and becomes the spare",
+                "feasible": crew_ok or match["status"] == "ok",
+                # The spare has no open item and its own stand: no sign-off or gate change needed for this flight
+                "blockers": []})
+
+    # E: cancel, but move as many of the flight's passengers as possible onto other flights TODAY
+    today = []
+    for r in conn.execute(
+            "SELECT f.flight_id, f.est_arr, SUM(s.occupant IS NULL) AS free FROM flights f JOIN seats s "
+            "ON s.flight_id = f.flight_id WHERE f.origin=? AND f.destination=? AND f.flight_id<>? AND f.est_dep>? "
+            "AND substr(f.est_dep, 1, 10) = substr(?, 1, 10) GROUP BY f.flight_id ORDER BY f.est_dep",
+            (db.HUB, flight["destination"], flight_id, flight["sched_dep"], flight["sched_dep"])):
+        if r["free"]:
+            today.append({"name": r["flight_id"], "seats": r["free"], "arrives": db.to_time(r["est_arr"]), "ticket": 0})
+    for p in PARTNER_SEATS.get(flight["destination"], ()):
+        today.append({"name": p["via"], "seats": p["seats"], "ticket": p["ticket_eur"],
+                      "arrives": db.to_time(f"{T._now():%Y-%m-%d} {p['arrives']}")})
+    if today:
+        left, comp_e, care_e, tickets, moved = pax, 0, 0, 0, []
+        sched_arr = db.to_time(flight["sched_arr"])
+        for alt in today:
+            n = min(alt["seats"], left)
+            if not n:
+                break
+            late = int((alt["arrives"] - sched_arr).total_seconds() // 60)
+            comp_e += n * compensation(km, late, rerouted=True)
+            care_e += n * care(late)
+            tickets += n * alt["ticket"]
+            left -= n
+            moved.append(f"{n} on {alt['name']} (arrives {alt['arrives']:%H:%M})")
+        comp_e += left * compensation(km, 24 * 60)
+        care_e += left * care(24 * 60, overnight=True)
+        options.append({
+            "id": "E", "title": f"Cancel {flight_id}, rebook {pax - left} passengers today, {left} tomorrow",
+            "actions": [f"Cancel {flight_id}"] + [f"Rebook {m}" for m in moved] +
+                       ([f"Hotels + rebooking tomorrow for {left} passengers"] if left else []),
+            "delay_min": 24 * 60,
+            "compensation_eur": comp_e,
+            "care_eur": care_e,
+            "operational_eur": tickets,
+            "knock_on": f"{ret_id} cancelled: {ret_pax} more passengers affected "
+                        f"(EUR {ret_pax * compensation(km, 24 * 60):,})",
+            "knock_on_eur": ret_pax * compensation(km, 24 * 60),
+            "feasible": True,
+            "blockers": [f"Aircraft {flight['aircraft_reg']} stays grounded until {', '.join(open_items)} is signed off "
+                         f"(no departure today, so nothing blocks the cancellation itself)"] if open_items else []})
+
+    # F: fallback if the closest standby crew cannot be used - the next legal crew, further away
+    backup = None if crew_ok or match["status"] != "ok" else _backup_crew(conn, flight, match)
+    if backup:
+        dep_f, team_f, changed = backup
+        delay_f = int((dep_f - sched).total_seconds() // 60)
+        options.append({
+            "id": "F", "title": f"Fallback crew ({', '.join(changed)}) + " + ("gate change + " if gate_problem else "") +
+                                f"depart {dep_f:%H:%M}",
+            "actions": [f"CREW_SWAP {','.join(c['crew_id'] for c in team_f)}"] +
+                       ([f"GATE_CHANGE ({gate_problem[0]})"] if gate_problem else []) +
+                       ([f"DELAY to {dep_f:%H:%M}"] if delay_f > 0 else []) + signoffs,
+            "delay_min": delay_f,
+            "compensation_eur": pax * compensation(km, delay_f),
+            "care_eur": pax * care(delay_f),
+            "operational_eur": STANDBY_CALLOUT_EUR * len(team_f),
+            "knock_on": f"None: {ret_id} keeps its slot. Use only if the closest standby crew is not available",
+            "feasible": True,
+            "blockers": maint_blockers})
+
     for o in options:
         o["total_eur"] = o["compensation_eur"] + o["care_eur"] + o["operational_eur"] + o.get("knock_on_eur", 0)
-    cheapest = min((o for o in options if o["feasible"]), key=lambda o: o["total_eur"])
+    feasible = [o for o in options if o["feasible"]]
+    # Best = lowest total cost; on a tie, the earliest departure wins (same money, passengers arrive sooner)
+    cheapest = min(feasible, key=lambda o: (o["total_eur"], o["delay_min"]))
+    tied = [o["id"] for o in feasible if o["total_eur"] == cheapest["total_eur"] and o is not cheapest]
     return {"flight": flight_id, "currency": "EUR", "basis": "EU261-style bands, indicative", "options": options,
-            "lowest_cost_feasible": cheapest["id"], "selected_by_controller": T.chosen_plan(conn, flight_id),
+            "lowest_cost_feasible": cheapest["id"], "lowest_cost_tied_with": tied,
+            "selected_by_controller": T.chosen_plan(conn, flight_id),
             "option_a_in_execution": T.approved_changes(conn, flight_id),
             "connecting_passengers": passenger_recovery(inbound["flight_id"])}
 
