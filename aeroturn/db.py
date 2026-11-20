@@ -205,6 +205,7 @@ DEFAULT_SCENARIO = {
     "crew_duty_left_min": 20,    # legal duty the inbound crew has left at landing
     "maintenance_open": True,    # is hydraulic inspection M-1001 still open?
     "seats_factor": 1.0,         # x free seats on the rebooking options
+    "second_disruption": False,  # also make EK-433 (Singapore) late -> a second, different case
 }
 EK812_SCHED_ARR = "2026-11-20 09:00"
 
@@ -297,10 +298,41 @@ def build(path=DB_PATH, **settings):
     conn.executemany("INSERT INTO maintenance_log VALUES (?,?,?,?,?,?,?)", maintenance)
     conn.executemany("INSERT INTO gates VALUES (?,?,?)", GATES)
     conn.executemany("INSERT INTO gate_bookings VALUES (?,?,?,?)", GATE_BOOKINGS)
+    if str(s["second_disruption"]) in ("True", "1"):
+        add_second_disruption(conn, landed)
     append_audit(conn, landed.strftime(TIME_FMT), "CODE", "database_built", f"seed {SEED}, scenario {s}", "ok")
     conn.commit()
     conn.close()
     return path
+
+
+def add_second_disruption(conn, clock):
+    """What-if: a second, very different disruption at the same time.
+    EK-433 from Singapore lands 70 min late just before the clock; its aircraft A6-ENX next flies EK-441 to
+    Mumbai. Unlike EK-812: the crew is legal, the gate is free and there is no open maintenance, so only a
+    short delay is needed. 3 passengers (1 wheelchair) miss EK-079 to Paris. All times follow the clock."""
+    land = clock - timedelta(minutes=5)
+    fmt = lambda dt: dt.strftime(TIME_FMT)
+    m = lambda n: timedelta(minutes=n)
+    dep_441, dep_079 = land + m(80), land + m(40)      # EK-441 needs 90 min turnaround -> a 10 min delay
+    conn.executemany("INSERT INTO flights VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+        ("EK-433", "SIN", "DXB", "A6-ENX", "B777-300ER", "WIDE", fmt(land - m(520)), fmt(land - m(450)),
+         fmt(land - m(70)), fmt(land), 450, "C12", "LANDED"),
+        ("EK-441", "DXB", "BOM", "A6-ENX", "B777-300ER", "WIDE", fmt(dep_441), fmt(dep_441),
+         fmt(dep_441 + m(185)), fmt(dep_441 + m(185)), 185, "C12", "SCHEDULED"),
+        ("EK-079", "DXB", "CDG", "A6-EPF", "B777-300ER", "WIDE", fmt(dep_079), fmt(dep_079),
+         fmt(dep_079 + m(410)), fmt(dep_079 + m(410)), 410, "B24", "BOARDING")])
+    conn.execute("INSERT INTO gates VALUES ('C12','C',1)")
+    conn.execute("INSERT INTO gate_bookings VALUES ('C12','EK-441',?,?)", (fmt(land - m(30)), fmt(dep_441)))
+    for i, tier in enumerate(["WCHR", "STANDARD", "STANDARD"]):
+        pid = f"Q{i + 1:03d}"
+        conn.execute("INSERT INTO passengers VALUES (?,?,?,?,?,?,?)",
+                     (pid, f"Singapore Pax {i + 1}", "EK-433", "EK-079", "CDG", tier, NEEDS[tier]))
+        conn.execute("INSERT INTO seats VALUES ('EK-079',?,?)", (f"10{'ABC'[i]}", pid))
+        conn.execute("INSERT INTO bags VALUES (?,?,'EK-079','IN_TRANSFER')", (f"BAG-Q{i + 1}", pid))
+    for i, role in enumerate(["Captain", "First Officer", "Purser", "Cabin Crew"]):   # rested crew
+        conn.execute("INSERT INTO crew VALUES (?,?,?,'INBOUND','EK-441','Aircraft A6-ENX',0,?)",
+                     (f"C-4{i}", f"{role} (EK-441)", role, fmt(land - m(120))))
 
 
 def connect(path=DB_PATH):
@@ -327,6 +359,7 @@ def scenario(conn):
     return {"delay_min": int(s["delay_min"]), "crew_duty_left_min": int(s["crew_duty_left_min"]),
             "maintenance_open": str(s["maintenance_open"]) not in ("False", "0"),
             "seats_factor": float(s["seats_factor"]),
+            "second_disruption": str(s["second_disruption"]) in ("True", "1"),
             "now": to_time(rows["now"]) if "now" in rows else NOW}
 
 

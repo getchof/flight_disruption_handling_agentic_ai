@@ -79,6 +79,26 @@ def test_costs_adapt():
     assert opts["options"][0]["total_eur"] == 0 and opts["options"][0]["delay_min"] == 0
 
 
+def test_second_late_flight_is_a_different_case():
+    build(second_disruption=True)
+    late = {d["inbound"]: d for d in T.disruptions()}
+    assert set(late) == {"EK-812", "EK-433"} and late["EK-433"]["outbound"] == "EK-441"
+    s = T.get_turnaround_and_crew_state("EK-433")
+    assert s["missed_connections"]["count"] == 3 and s["missed_connections"]["vulnerable"] == 1
+    assert all(c["legal_for_outbound"] for c in s["crew_on_outbound"]) and not s["outbound"]["gate_problem"]
+    earliest = s["outbound"]["earliest_legal_departure"]               # 90 min after EK-433 landed
+    assert T.stage_controller_schedule_change("DELAY", "EK-441", "10:30")["status"] == "blocked"
+    assert T.stage_controller_schedule_change("DELAY", "EK-441", earliest)["status"] == "pending_controller_approval"
+    # EK-812 is untouched by the second disruption
+    assert T.get_turnaround_and_crew_state("EK-812")["missed_connections"]["count"] == 45
+
+
+def test_second_disruption_follows_the_clock():
+    build(delay_min=30, second_disruption=True)                      # clock 09:30
+    s = T.get_turnaround_and_crew_state("EK-433")
+    assert s["inbound"]["actual_arrival"] == "09:25" and s["missed_connections"]["count"] == 3
+
+
 def test_rollback_and_integrity_hold_in_any_scenario():
     s = build(delay_min=150, seats_factor=0.5)
     conn = db.connect(T.DB)

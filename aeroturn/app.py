@@ -276,30 +276,33 @@ def act_reset():
     ss.flash = ("success", "Scenario reset: same settings, fresh data.")
 
 
-# What-if presets: (delay min, crew duty left at landing, M-1001 open, x free seats)
+# What-if presets: (delay min, crew duty left at landing, M-1001 open, x free seats, second late flight)
 SCENARIOS = {
-    "Brief: EK-812 +75 min (the official scenario)": (75, 20, True, 1.0),
-    "Short delay +30 min, rested crew": (30, 600, True, 1.0),
-    "+45 min: only New York connections break": (45, 20, True, 1.0),
-    "Long delay +150 min: Mumbai breaks too": (150, 20, True, 1.0),
-    "Seat crunch: +75 min, half the free seats": (75, 20, True, 0.5),
-    "Clean: +30 min, rested crew, inspection done": (30, 600, False, 1.0),
+    "Brief: EK-812 +75 min (the official scenario)": (75, 20, True, 1.0, False),
+    "Two late flights at once (+ EK-433 Singapore)": (75, 20, True, 1.0, True),
+    "Short delay +30 min, rested crew": (30, 600, True, 1.0, False),
+    "+45 min: only New York connections break": (45, 20, True, 1.0, False),
+    "Long delay +150 min: Mumbai breaks too": (150, 20, True, 1.0, False),
+    "Seat crunch: +75 min, half the free seats": (75, 20, True, 0.5, False),
+    "Clean: +30 min, rested crew, inspection done": (30, 600, False, 1.0, False),
 }
 
 
 def act_build_scenario():
     T.reset(delay_min=ss.wi_delay, crew_duty_left_min=ss.wi_crew, maintenance_open=ss.wi_maint,
-            seats_factor=ss.wi_seats)
+            seats_factor=ss.wi_seats, second_disruption=ss.wi_second)
     T.SIMULATE_SEAT_CONFLICT["enabled"] = T.SIMULATE_BAG_CONFLICT["enabled"] = False
     ss.timeline, ss.brief, ss.models, ss.redteam = [], None, [], None
+    ss.pop("inbound", None)            # start on the first late flight of the new scenario
     add_step("👤 HUMAN", "What-if scenario built", "sent",
              f"EK-812 +{ss.wi_delay} min · crew {ss.wi_crew} min duty left · M-1001 "
-             f"{'OPEN' if ss.wi_maint else 'signed off'} · free seats x{ss.wi_seats}")
+             f"{'OPEN' if ss.wi_maint else 'signed off'} · free seats x{ss.wi_seats}"
+             f"{' · + EK-433 Singapore also late' if ss.wi_second else ''}")
 
 
 def act_pick_preset():
-    d, c, m, s = SCENARIOS[ss.wi_preset]
-    ss.wi_delay, ss.wi_crew, ss.wi_maint, ss.wi_seats = d, c, m, s
+    d, c, m, s, two = SCENARIOS[ss.wi_preset]
+    ss.wi_delay, ss.wi_crew, ss.wi_maint, ss.wi_seats, ss.wi_second = d, c, m, s, two
 
 
 # =====================================================================
@@ -313,8 +316,8 @@ if not late:
     st.button("↺ Reset scenario", on_click=act_reset)
     st.stop()
 late_ids = [d["inbound"] for d in late]
-if ss.get("inbound") not in late_ids:
-    ss.inbound = late_ids[0]
+if ss.get("inbound") not in late_ids:   # default: the disruption with the most missed connections
+    ss.inbound = max(late, key=lambda d: d["missed_connections"])["inbound"]
 D = next(d for d in late if d["inbound"] == ss.inbound)
 S0 = T.get_turnaround_and_crew_state(D["inbound"])
 OUT = S0["outbound"]["flight"]
@@ -346,21 +349,34 @@ with left:
         ss.setdefault("wi_crew", cur["crew_duty_left_min"])
         ss.setdefault("wi_maint", cur["maintenance_open"])
         ss.setdefault("wi_seats", cur["seats_factor"])
+        ss.setdefault("wi_second", cur["second_disruption"])
         st.selectbox("Preset", list(SCENARIOS), key="wi_preset", on_change=act_pick_preset)
         st.slider("EK-812 delay (min)", 0, 180, step=5, key="wi_delay")
         st.slider("Inbound crew duty left at landing (min)", 0, 720, step=10, key="wi_crew",
                   help="EK-813 needs 465 min flight + 30 min post-flight = 495 min after departure.")
         st.toggle("Hydraulic inspection M-1001 still open", key="wi_maint")
         st.slider("Free seats on rebooking flights (x)", 0.0, 2.0, step=0.25, key="wi_seats")
+        st.toggle("Add a second late flight (EK-433 from Singapore)", key="wi_second",
+                  help="A different case at the same time: legal crew, free gate, no maintenance - only a short "
+                       "delay is needed.")
         st.button("🔁 Build this scenario", on_click=act_build_scenario, width="stretch", type="secondary",
                   disabled=BUSY, help=BUSY_HELP if BUSY else None)
         st.caption("Rebuilds the database. Rules, critical path, costs and the AI all adapt; nothing is hard-coded.")
+        if len(late) > 1:   # only a what-if scenario has more than one late flight: choose which one to work on
+            st.selectbox("Work on disruption", late_ids, key="inbound",
+                         format_func=lambda f: next(f"{d['inbound']} {d['route']} +{d['delay_min']} min → "
+                                                    f"{d['outbound']}" for d in late if d["inbound"] == f),
+                         help="Every late inbound flight found by code. The aircraft's next flight is found by "
+                              "its registration.")
 
     st.markdown("#### 🛠️ Control")
-    st.selectbox("Disruption", late_ids, key="inbound",
-                 format_func=lambda f: next(f"{d['inbound']} {d['route']} +{d['delay_min']} min → {d['outbound']}"
-                                            for d in late if d["inbound"] == f),
-                 help="Every late inbound flight found by code. The aircraft's next flight is found by its registration.")
+    # Control shows only the disruption being worked on: the brief's scenario by itself.
+    # Other scenarios (other delays, a second late flight) live in the What-if builder above.
+    is_brief = T.current_settings() == db.DEFAULT_SCENARIO
+    current = f"{D['inbound']} {D['route']} +{D['delay_min']} min → {OUT}"
+    st.selectbox("Disruption", [f"Brief: {current}" if is_brief else f"What-if: {current}"], key="disruption_view",
+                 help="The brief's scenario. To try other delays or a second late flight, use the "
+                      "What-if scenario builder above.")
     providers = agent.available_providers()
     options = ["Auto · full fallback chain"] + [p["name"] for p in providers] + ["Local only (Ollama)"]
     choice = st.selectbox("AI provider", options, help="Auto tries each provider in order until one answers.")
